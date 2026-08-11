@@ -1,0 +1,41 @@
+# environments
+myenv/
+venv/
+.venv/
+.plotly-venv/
+
+# python
+__pycache__/
+*.pyc
+
+# data & outputs
+data/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.csv
+*.parquet
+*.npz
+
+# misc
+.DS_Store
+logs/
+*.out
+
+preprocess/
+kg-construction/
+expalainability_from_other_repo/
+
+# remove the test plots folder
+plots_parallel/
+plots_parallel_*
+
+plots_*/
+plots_*
+
+old_plots/
+# # keep CSV files in plots/
+# !plots/
+# !plots/**/*.csv

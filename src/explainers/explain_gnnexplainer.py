@@ -1,4 +1,3 @@
-"""Standalone stock-PyG GNNExplainer for the R-GCN event-pair model."""
 
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ from src.explainers.gnnexplainer_core import (
     validate_classification_task,
 )
 from src.fidelity.fidelity_utils import task_target_value_nodes
-from src.train import _sanitize, get_event_attrs
+from src.gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -222,12 +221,12 @@ def main() -> None:
     summary_rows: List[dict] = []
 
     for pair_idx in tqdm(context.pair_indices, desc="GNNExplainer pairs"):
-        src_global, dst_global = context.val_pairs[pair_idx]
+        src_global, dst_global = context.test_pairs[pair_idx]
         if args.gnn_subgraph_hop > 0:
             nodes, edge_index, edge_type, global_to_local = _k_hop_subgraph(
                 seeds=[src_global, dst_global],
-                edge_index=context.ei_val,
-                edge_type=context.et_val,
+                edge_index=context.ei_test,
+                edge_type=context.et_test,
                 num_nodes=context.x.size(0),
                 k=args.gnn_subgraph_hop,
             )
@@ -236,7 +235,7 @@ def main() -> None:
         else:
             nodes = torch.arange(context.x.size(0))
             x_sub = context.x.detach()
-            edge_index, edge_type = context.ei_val, context.et_val
+            edge_index, edge_type = context.ei_test, context.et_test
             global_to_local = {node: node for node in range(context.x.size(0))}
 
         src_local = global_to_local[src_global]
@@ -383,7 +382,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "meta.json"),
         args,
-        context.n_val,
+        context.n_test,
         context.pair_indices,
         context.tasks,
         extra_fields={

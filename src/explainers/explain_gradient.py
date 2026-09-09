@@ -1,10 +1,3 @@
-"""
-Input*Gradient saliency explainer for the R-GCN event-pair model.
-
-For each sampled validation pair and task a single backward pass computes
-signed and absolute Input * Gradient scores per RDF entity.
-
-"""
 
 from __future__ import annotations
 
@@ -34,7 +27,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.train import get_event_attrs
+from src.gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
 
@@ -80,7 +73,7 @@ def _gradient_saliency(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
     use_model_target: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
@@ -120,11 +113,11 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_val, et_val = ctx.ei_val, ctx.et_val
-    val_pairs = ctx.val_pairs
-    y_act_val, y_time_val = ctx.y_act_val, ctx.y_time_val
+    ei_test, et_test = ctx.ei_test, ctx.et_test
+    test_pairs = ctx.test_pairs
+    y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
-    tasks, n_val, pair_indices = ctx.tasks, ctx.n_val, ctx.pair_indices
+    tasks, n_test, pair_indices = ctx.tasks, ctx.n_test, ctx.pair_indices
 
     os.makedirs(args.out, exist_ok=True)
     gradient_dir = os.path.join(args.out, "gradient")
@@ -136,13 +129,13 @@ def main() -> None:
     summary_rows: List[dict] = []
 
     for pi in tqdm(pair_indices, desc="pairs"):
-        src_id, dst_id = val_pairs[pi]
+        src_id, dst_id = test_pairs[pi]
 
         if args.k_hop > 0:
             nodes_t, ei_work, et_work, g2l = _k_hop_subgraph(
                 seeds=[src_id, dst_id],
-                edge_index=ei_val.detach().cpu(),
-                edge_type=et_val.detach().cpu(),
+                edge_index=ei_test.detach().cpu(),
+                edge_type=et_test.detach().cpu(),
                 num_nodes=x.size(0),
                 k=args.k_hop,
             )
@@ -154,8 +147,8 @@ def main() -> None:
             local_to_global = [int(n) for n in nodes_t.tolist()]
         else:
             x_work = x
-            ei_work = ei_val
-            et_work = et_val
+            ei_work = ei_test
+            et_work = et_test
             src_work = src_id
             dst_work = dst_id
             local_to_global = list(range(x.size(0)))
@@ -164,7 +157,7 @@ def main() -> None:
             try:
                 gxi_signed, gxi_abs, pred_meta = _gradient_saliency(
                     encoder, head, x_work, ei_work, et_work,
-                    src_work, task, y_act_val, y_time_val, pi, device,
+                    src_work, task, y_act_test, y_time_test, pi, device,
                     use_model_target=True,
                 )
             except Exception as exc:
@@ -263,7 +256,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "summary_gradient.json"),
         args,
-        n_val,
+        n_test,
         pair_indices,
         tasks,
         extra_fields={

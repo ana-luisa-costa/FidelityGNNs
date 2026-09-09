@@ -1,9 +1,3 @@
-"""Shared PROPHET optimizer for the R-GCN model.
-
-The implementation follows the mask optimization released with PROPHET while
-using the paper's individual-node mask. It explains the model's original
-predicted class and learns node and edge masks jointly.
-"""
 
 from __future__ import annotations
 
@@ -18,10 +12,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.explain.algorithm.utils import clear_masks
-from src.train import MultiTaskHead, RGCNEncoder, _sanitize
+from src.gnn4ppm.train import MultiTaskHead, RGCNEncoder, _sanitize
 
 _RESOURCE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_resource"
-_TASK_ALIASES = {"resource": f"otherC_{_sanitize(_RESOURCE_OTHERC_RAW_KEY)}"}
+_ROLE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_role"
+_LIFECYCLE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_lifecycle_transition"
+_TASK_ALIASES = {
+    "resource": f"otherC_{_sanitize(_RESOURCE_OTHERC_RAW_KEY)}",
+    "role": f"otherC_{_sanitize(_ROLE_OTHERC_RAW_KEY)}",
+    "lifecycle": f"otherC_{_sanitize(_LIFECYCLE_OTHERC_RAW_KEY)}",
+}
 
 
 @dataclass(frozen=True)

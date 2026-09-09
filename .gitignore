@@ -7,6 +7,7 @@ venv/
 # python
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # data & outputs
 data/
@@ -18,6 +19,7 @@ data/
 *.csv
 *.parquet
 *.npz
+old/
 
 # misc
 .DS_Store
@@ -26,7 +28,6 @@ logs/
 
 preprocess/
 kg-construction/
-expalainability_from_other_repo/
 
 # remove the test plots folder
 plots_parallel/

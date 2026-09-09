@@ -1,4 +1,3 @@
-"""FOX neuro-fuzzy surrogate explainer for the R-GCN event-pair model."""
 
 from __future__ import annotations
 
@@ -32,7 +31,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.train import get_event_attrs
+from src.gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
 
@@ -321,11 +320,11 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_val, et_val = ctx.ei_val, ctx.et_val
-    val_pairs = ctx.val_pairs
-    y_act_val, y_time_val = ctx.y_act_val, ctx.y_time_val
+    ei_test, et_test = ctx.ei_test, ctx.et_test
+    test_pairs = ctx.test_pairs
+    y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
-    tasks, n_val, pair_indices = ctx.tasks, ctx.n_val, ctx.pair_indices
+    tasks, n_test, pair_indices = ctx.tasks, ctx.n_test, ctx.pair_indices
     rng = ctx.rng
 
     os.makedirs(args.out, exist_ok=True)
@@ -339,7 +338,7 @@ def main() -> None:
     summary_rows: List[dict] = []
 
     for pi in tqdm(pair_indices, desc="pairs"):
-        src_id, dst_id = val_pairs[pi]
+        src_id, dst_id = test_pairs[pi]
         exclude = {src_id}
         if args.fox_exclude_dst:
             exclude.add(dst_id)
@@ -347,8 +346,8 @@ def main() -> None:
         for task in tasks:
             try:
                 feat_ids = _gradient_top_ids(
-                    encoder, head, x, ei_val, et_val,
-                    src_id, task, y_act_val, y_time_val, pi, device,
+                    encoder, head, x, ei_test, et_test,
+                    src_id, task, y_act_test, y_time_test, pi, device,
                     args.fox_m, exclude,
                 )
             except Exception as exc:
@@ -361,9 +360,9 @@ def main() -> None:
 
             try:
                 anfis_model, importance = _fox_explain(
-                    encoder, head, x, ei_val, et_val,
+                    encoder, head, x, ei_test, et_test,
                     src_id, feat_ids, task,
-                    y_act_val, y_time_val, pi, device,
+                    y_act_test, y_time_test, pi, device,
                     n_perturb=args.fox_perturb,
                     num_mfs=args.fox_num_mfs,
                     epochs=args.fox_epochs,
@@ -394,8 +393,8 @@ def main() -> None:
                     "fox_importance": float(importance[j]),
                     "dst_activity": act_label,
                 }
-                if task == "activity" and y_act_val is not None:
-                    ya = int(y_act_val[pi].item())
+                if task == "activity" and y_act_test is not None:
+                    ya = int(y_act_test[pi].item())
                     row["y_act_id"] = ya
                     row["y_act_name"] = id2act.get(ya, "")
                 rows.append(row)
@@ -478,7 +477,7 @@ def main() -> None:
             xlabel="Mean FOX importance (normalised ANFIS attribution over sampled pairs)",
         )
 
-    write_summary_json(os.path.join(args.out, "summary_fox.json"), args, n_val, pair_indices, tasks,
+    write_summary_json(os.path.join(args.out, "summary_fox.json"), args, n_test, pair_indices, tasks,
                        extra_fields={
                            "fox_m": args.fox_m, "fox_num_mfs": args.fox_num_mfs,
                            "fox_perturb": args.fox_perturb, "fox_epochs": args.fox_epochs,

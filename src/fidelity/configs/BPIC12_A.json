@@ -5,7 +5,7 @@
   "case_split": "data/raw/BPIC12_A/case_split.json",
   "model": "data/processed/BPIC12_A/best_val_model.pt",
   "vocabs": "data/processed/BPIC12_A/best_val_vocabs.json",
-  "best_val": "data/processed/BPIC12_A/best_val.pt",
+  "best_test": "data/processed/BPIC12_A/best_val.pt",
   "out": "data/processed/BPIC12_A/fidelity_curves",
   "tasks": "activity,resource,role,lifecycle",
   "num_samples": 100,

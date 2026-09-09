@@ -1,4 +1,3 @@
-"""Standalone PROPHET runner using the shared node-edge mask optimizer."""
 
 from __future__ import annotations
 
@@ -19,13 +18,11 @@ from src.explainers._shared import (
     ExplainerContext,
     _entity_short_label,
     _k_hop_subgraph,
-    _pair_side_caption,
     add_common_explainer_args,
     load_explainer_context,
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.explainers.explain_prophet_plots import plot_local, plot_node_importance
 from src.explainers.prophet_core import (
     ProphetConfig,
     ProphetExplanation,
@@ -34,7 +31,7 @@ from src.explainers.prophet_core import (
     validate_classification_task,
 )
 from src.fidelity.fidelity_utils import task_target_value_nodes
-from src.train import _sanitize, get_event_attrs
+from src.gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -198,8 +195,8 @@ def main() -> None:
     context: ExplainerContext = load_explainer_context(args, device)
     encoder, head = context.encoder, context.head
     x, graph, id2ent = context.x, context.g, context.id2ent
-    ei_val, et_val = context.ei_val, context.et_val
-    val_pairs = context.val_pairs
+    ei_test, et_test = context.ei_test, context.et_test
+    test_pairs = context.test_pairs
     num_rel, rel2id = context.num_rel, context.rel2id
     id2rel = {value: key for key, value in rel2id.items()}
     tasks, pair_indices = context.tasks, context.pair_indices
@@ -208,18 +205,16 @@ def main() -> None:
     otherc_id2label = _otherc_id2label_by_key(vocabs)
 
     pair_dir = os.path.join(args.out, "per_pair")
-    plot_dir = os.path.join(args.out, "prophet")
     os.makedirs(pair_dir, exist_ok=True)
-    os.makedirs(plot_dir, exist_ok=True)
 
     summary_rows: List[dict] = []
     for pair_idx in tqdm(pair_indices, desc="PROPHET pairs"):
-        src_global, dst_global = val_pairs[pair_idx]
+        src_global, dst_global = test_pairs[pair_idx]
         if args.prophet_subgraph_hop > 0:
             nodes, ei_sub, et_sub, g2l = _k_hop_subgraph(
                 seeds=[src_global, dst_global],
-                edge_index=ei_val,
-                edge_type=et_val,
+                edge_index=ei_test,
+                edge_type=et_test,
                 num_nodes=x.size(0),
                 k=args.prophet_subgraph_hop,
             )
@@ -227,7 +222,7 @@ def main() -> None:
             ei_sub, et_sub = ei_sub.to(device), et_sub.to(device)
         else:
             nodes = torch.arange(x.size(0))
-            x_sub, ei_sub, et_sub = x.detach(), ei_val, et_val
+            x_sub, ei_sub, et_sub = x.detach(), ei_test, et_test
             g2l = {index: index for index in range(x.size(0))}
 
         src_local = g2l[src_global]
@@ -316,38 +311,6 @@ def main() -> None:
                 os.path.join(pair_dir, trace_csv), index=False
             )
 
-            top_rows = [row for row in node_rows if not row["is_protected"]][
-                : args.top_nodes
-            ]
-            side_text = _pair_side_caption(
-                graph, id2ent, src_global, dst_global, pair_idx
-            )
-            plot_node_importance(
-                scores=np.asarray([row["node_mask"] for row in top_rows]),
-                labels=[str(row["label"]) for row in top_rows],
-                title=f"PROPHET node importance (pair {pair_idx}, {task})",
-                out_path=os.path.join(plot_dir, f"{stem}_nodes.png"),
-                pair_side_text=side_text,
-            )
-            plot_local(
-                g_rdf=graph,
-                id2ent=id2ent,
-                nodes_global=nodes,
-                ei_sub_local=ei_sub.cpu(),
-                et_sub=et_sub.cpu(),
-                rel2id=rel2id,
-                node_mask=explanation.node_mask.cpu(),
-                edge_mask=explanation.edge_mask.cpu(),
-                protected_nodes=explanation.protected_nodes,
-                src_local=src_local,
-                dst_local=dst_local,
-                task=task,
-                pair_idx=pair_idx,
-                top_nodes=args.top_nodes,
-                top_edges=args.top_edges,
-                out_path=os.path.join(plot_dir, f"{stem}_graph.png"),
-            )
-
             dst_activity, _, _, _ = get_event_attrs(
                 graph, id2ent.get(dst_global, "?")
             )
@@ -397,7 +360,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "meta.json"),
         args,
-        context.n_val,
+        context.n_test,
         pair_indices,
         tasks,
         extra_fields={

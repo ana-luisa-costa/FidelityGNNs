@@ -1,5 +1,3 @@
-"""Compute probability and accuracy fidelity curves for RGCN explainers."""
-
 from __future__ import annotations
 
 import argparse
@@ -7,6 +5,7 @@ import csv
 import hashlib
 import os
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -69,12 +68,12 @@ CHECKPOINT_FIELDS = [
 ]
 DEFAULTS = {
     "ttl": "data/raw/BPIC13_O/BPIC13_OpenProblems.ttl",
-    "emb": "data/processed/BPIC13_O/entity_embeddings.npy",
-    "entity2id": "data/processed/BPIC13_O/entity2id.json",
-    "case_split": "data/processed/BPIC13_O/case_split.json",
+    "emb": "data/raw/BPIC13_O/entity_embeddings.npy",
+    "entity2id": "data/raw/BPIC13_O/entity2id.json",
+    "case_split": "data/raw/BPIC13_O/case_split.json",
     "model": "data/processed/BPIC13_O/best_val_model.pt",
     "vocabs": "data/processed/BPIC13_O/best_val_vocabs.json",
-    "best_val": "data/processed/BPIC13_O/best_val.pt",
+    "best_test": "data/processed/BPIC13_O/best_val.pt",
     "out": "data/processed/BPIC13_O/fidelity_curves",
     "tasks": "activity,resource,role,lifecycle",
     "num_samples": 20,
@@ -107,6 +106,9 @@ CompletedKey = Tuple[str, int, str, int]
 def _build_arg_parser(config_defaults: Optional[Dict[str, Any]] = None) -> argparse.ArgumentParser:
     defaults = dict(DEFAULTS)
     defaults.update(config_defaults or {})
+    # accept configs from before the val->test rename
+    if "best_val" in defaults:
+        defaults.setdefault("best_test", defaults.pop("best_val"))
     parser = argparse.ArgumentParser(
         description="Compute PyG/GraphFramEx model-fidelity curves for RGCN explainers.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -453,12 +455,12 @@ def _write_aggregates(
             y_plus = group[f"mean_fid_{metric}_plus"].to_numpy(dtype=float)
             y_minus = group[f"mean_fid_{metric}_minus"].to_numpy(dtype=float)
             y_one_minus = 1.0 - y_minus
-            auc_plus = float(auc_fn(y_plus, x))
-            auc_minus = float(auc_fn(y_minus, x))
-            auc_one_minus = float(auc_fn(y_one_minus, x))
-            norm_plus = auc_plus / span if span > 0 else float("nan")
-            norm_minus = auc_minus / span if span > 0 else float("nan")
-            norm_one_minus = auc_one_minus / span if span > 0 else float("nan")
+            auc_plus = float(y_plus.mean())
+            auc_minus = float(y_minus.mean())
+            auc_one_minus = float(y_one_minus.mean())
+            norm_plus = auc_plus
+            norm_minus = auc_minus
+            norm_one_minus = auc_one_minus
             score = float("nan")
             if np.isfinite(norm_plus) and np.isfinite(norm_minus):
                 a = min(1.0, max(0.0, norm_plus))
@@ -482,11 +484,14 @@ def _write_aggregates(
 
 
 def main() -> None:
+    mode_start = time.perf_counter()
+
     config_defaults, config_path = load_config_defaults()
     parser = _build_arg_parser(config_defaults)
     args = parser.parse_args()
     if config_path is not None:
         print(f"Loaded config -> {config_path}")
+    print(f"Heterogeneity mode: {args.heterogeneity_mode}")
 
     top_k_values = _parse_top_k_values(args.top_k_values)
     fidelity_metrics = _parse_fidelity_metrics(args.fidelity_metrics)
@@ -517,7 +522,7 @@ def main() -> None:
     if completed:
         print(f"Loaded {len(completed)} completed rows from {checkpoint_path}")
 
-    write_selected_pairs(out_dir / "selected_pairs.csv", ctx.pair_indices, ctx.val_pairs)
+    write_selected_pairs(out_dir / "selected_pairs.csv", ctx.pair_indices, ctx.test_pairs)
     write_manifest(
         out_dir / "experiment_manifest.json",
         args=args,
@@ -533,17 +538,17 @@ def main() -> None:
     head.eval()
 
     for pair_number, pair_idx in enumerate(ctx.pair_indices, start=1):
-        src_id, dst_id = ctx.val_pairs[pair_idx]
+        src_id, dst_id = ctx.test_pairs[pair_idx]
         print(
             f"Pair {pair_number}/{len(ctx.pair_indices)} "
-            f"[val_pairs[{pair_idx}]] src={src_id} dst={dst_id}"
+            f"[test_pairs[{pair_idx}]] src={src_id} dst={dst_id}"
         )
 
         try:
             nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph(
                 seeds=[src_id, dst_id],
-                edge_index=ctx.ei_val,
-                edge_type=ctx.et_val,
+                edge_index=ctx.ei_test,
+                edge_type=ctx.et_test,
                 num_nodes=ctx.x.size(0),
                 k=args.subgraph_hops,
             )
@@ -622,8 +627,8 @@ def main() -> None:
                         src_local,
                         dst_local,
                         task,
-                        ctx.y_act_val,
-                        ctx.y_time_val,
+                        ctx.y_act_test,
+                        ctx.y_time_test,
                         pair_idx,
                         device,
                         use_model_target=True,
@@ -737,6 +742,9 @@ def main() -> None:
     _write_aggregates(
         checkpoint_path, summary_path, auc_path, top_k_values, fidelity_metrics
     )
+
+    elapsed = time.perf_counter() - mode_start
+    print(f"Heterogeneity mode '{args.heterogeneity_mode}' finished in {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

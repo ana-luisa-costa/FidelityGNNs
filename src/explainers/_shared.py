@@ -1,4 +1,3 @@
-"""Shared utilities for all R-GCN explainability scripts."""
 
 from __future__ import annotations
 
@@ -16,12 +15,12 @@ import pandas as pd
 import torch
 from rdflib import Graph
 
-from src.train import (
+from src.gnn4ppm.train import (
     MultiTaskHead,
     RGCNEncoder,
     _sanitize,
-    add_inverse_edges,
     build_graph,
+    build_train_directly_follows,
     get_event_attrs,
 )
 from src.utils.io_helpers import (
@@ -57,7 +56,7 @@ def _build_model_from_checkpoint(
         in_dim,
         hid,
         hid,
-        num_rel * 2,
+        num_rel,
         num_bases=best["num_bases"],
         dropout=best["dropout"],
     ).to(device)
@@ -90,13 +89,13 @@ def _case_map_from_ent2id(
     return case_map
 
 
-def _build_train_val_pairs(
+def _build_train_test_pairs(
     case_map: Dict[str, Dict[int, int]],
     train_cases: Set[str],
-    val_cases: Set[str],
+    test_cases: Set[str],
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
     train_pairs: List[Tuple[int, int]] = []
-    val_pairs: List[Tuple[int, int]] = []
+    test_pairs: List[Tuple[int, int]] = []
     for cid, km in case_map.items():
         ks = sorted(km.keys())
         case_pairs = [
@@ -104,9 +103,9 @@ def _build_train_val_pairs(
         ]
         if cid in train_cases:
             train_pairs.extend(case_pairs)
-        elif cid in val_cases:
-            val_pairs.extend(case_pairs)
-    return train_pairs, val_pairs
+        elif cid in test_cases:
+            test_pairs.extend(case_pairs)
+    return train_pairs, test_pairs
 
 
 def _scalar_for_task(
@@ -114,13 +113,13 @@ def _scalar_for_task(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
 ) -> torch.Tensor:
     oa = out["act"][0]
     if task == "activity":
-        if y_act is not None and y_act[pair_val_idx].item() >= 0:
-            c = int(y_act[pair_val_idx].item())
+        if y_act is not None and y_act[pair_test_idx].item() >= 0:
+            c = int(y_act[pair_test_idx].item())
             return oa[c]
         return oa.max()
     if task == "time":
@@ -438,7 +437,7 @@ def _pair_side_caption(
     return (
         f"src:\n{src_lab}\n(#{src_id})\n{su_wrapped}\n\n"
         f"dst:\n{dst_lab}\n(#{dst_id})\n{du_wrapped}\n\n"
-        f"val_pairs[{pi}]"
+        f"test_pairs[{pi}]"
     )
 
 
@@ -606,14 +605,15 @@ def add_common_explainer_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--ttl", required=True, help="RDF/Turtle knowledge-graph file.")
     ap.add_argument("--emb", required=True, help="Entity embeddings (.npy).")
     ap.add_argument("--entity2id", required=True, help="entity2id.json mapping.")
-    ap.add_argument("--case_split", required=True, help="case_split.json (train/val case IDs).")
+    ap.add_argument("--case_split", required=True, help="case_split.json (train/test case IDs).")
     ap.add_argument("--model", required=True, help="*_model.pt checkpoint from train.py.")
     ap.add_argument("--vocabs", default=None, help="*_vocabs.json for activity names.")
     ap.add_argument(
+        "--best-test",
         "--best-val",
-        dest="best_val",
+        dest="best_test",
         default=None,
-        help="best_val.pt with validation labels. If omitted, activity uses max logit.",
+        help="best_test.pt with test labels. If omitted, activity uses max logit.",
     )
     ap.add_argument("--out", required=True, help="Output directory.")
     ap.add_argument(
@@ -625,13 +625,13 @@ def add_common_explainer_args(ap: argparse.ArgumentParser) -> None:
         ),
     )
     ap.add_argument("--num-samples", type=int, default=10,
-                    help="Number of validation pairs to explain.")
+                    help="Number of test pairs to explain.")
     ap.add_argument("--seed", type=int, default=42, help="Random seed.")
     ap.add_argument(
         "--sample-seed",
         type=int,
         default=None,
-        help="Seed for validation-pair sampling. Defaults to --seed.",
+        help="Seed for test-pair sampling. Defaults to --seed.",
     )
 
 
@@ -642,19 +642,19 @@ class ExplainerContext:
     x: torch.Tensor
     g: Graph
     id2ent: Dict[int, str]
-    ei_val: torch.Tensor
-    et_val: torch.Tensor
+    ei_test: torch.Tensor
+    et_test: torch.Tensor
     rel2id: Dict[str, int]
     num_rel: int
-    val_pairs: List[Tuple[int, int]]
-    y_act_val: Optional[torch.Tensor]
-    y_time_val: Optional[torch.Tensor]
+    test_pairs: List[Tuple[int, int]]
+    y_act_test: Optional[torch.Tensor]
+    y_time_test: Optional[torch.Tensor]
     act_vocab: Dict[str, int]
     id2act: Dict[int, str]
     tasks: List[str]
     task_aliases: Dict[str, str]
     skipped_tasks: List[Dict[str, str]]
-    n_val: int
+    n_test: int
     pair_indices: List[int]
     rng: Any
 
@@ -677,7 +677,7 @@ def load_explainer_context(
     id2ent: Dict[int, str] = {i: e for e, i in ent2id.items()}
     x = load_embeddings(args.emb).to(device)
 
-    train_cases, val_cases = load_case_split(args.case_split)
+    train_cases, test_cases = load_case_split(args.case_split)
 
     print("Parsing TTL …")
     g = Graph()
@@ -687,31 +687,36 @@ def load_explainer_context(
     num_rel = len(rel2id)
     assert num_rel == ckpt["num_rel"], "TTL graph relation count mismatch with checkpoint"
 
-    ei_val, et_val = build_graph(
+    ei_test, et_test = build_graph(
         g,
         ent2id,
         rel2id,
         excluded_cases=train_cases,
         allow_new_relations=False,
     )
-    ei_val, et_val = add_inverse_edges(ei_val, et_val, num_rel)
-    ei_val, et_val = ei_val.to(device), et_val.to(device)
+    # same train-only directlyFollows edges the model was trained with
+    ei_df, et_df = build_train_directly_follows(
+        g, ent2id, rel2id, train_cases, allow_new_relations=False,
+    )
+    ei_test = torch.cat([ei_test, ei_df], dim=1)
+    et_test = torch.cat([et_test, et_df])
+    ei_test, et_test = ei_test.to(device), et_test.to(device)
 
     case_map = _case_map_from_ent2id(id2ent)
-    _, val_pairs = _build_train_val_pairs(case_map, train_cases, val_cases)
+    _, test_pairs = _build_train_test_pairs(case_map, train_cases, test_cases)
 
-    y_act_val: Optional[torch.Tensor] = None
-    y_time_val: Optional[torch.Tensor] = None
-    if args.best_val:
-        bv = load_pt(args.best_val)
-        y_act_val = bv["y_act"].to(device)
-        y_time_val = bv["y_time"].to(device)
-        pv = bv["pairs_val"]
-        val_pairs_t = torch.tensor(val_pairs, dtype=torch.long)
-        if pv.shape != val_pairs_t.shape or not torch.all(pv == val_pairs_t):
-            print("[warn] best-val pairs_val differs from rebuilt val_pairs")
-        if y_act_val.numel() != len(val_pairs):
-            raise ValueError("best_val y_act length does not match number of val pairs")
+    y_act_test: Optional[torch.Tensor] = None
+    y_time_test: Optional[torch.Tensor] = None
+    if args.best_test:
+        bv = load_pt(args.best_test)
+        y_act_test = bv["y_act"].to(device)
+        y_time_test = bv["y_time"].to(device)
+        pv = bv["pairs_test"] 
+        test_pairs_t = torch.tensor(test_pairs, dtype=torch.long)
+        if pv.shape != test_pairs_t.shape or not torch.all(pv == test_pairs_t):
+            print("[warn] best-test pairs_test differs from rebuilt test_pairs")
+        if y_act_test.numel() != len(test_pairs):
+            raise ValueError("best_test y_act length does not match number of test pairs")
 
     voc = load_vocabs(args.vocabs) if args.vocabs else {}
     act_vocab: Dict[str, int] = voc.get("act_vocab", {})
@@ -721,14 +726,14 @@ def load_explainer_context(
     if skipped_tasks:
         skipped_text = ", ".join(item["requested"] for item in skipped_tasks)
         print(f"[warn] Skipped unavailable tasks: {skipped_text}")
-    n_val = len(val_pairs)
-    if n_val == 0:
-        raise RuntimeError("No validation pairs to explain.")
+    n_test = len(test_pairs)
+    if n_test == 0:
+        raise RuntimeError("No test pairs to explain.")
 
-    sample_n = min(args.num_samples, n_val)
-    pair_indices = sorted(sample_rng.choice(n_val, size=sample_n, replace=False).tolist())
+    sample_n = min(args.num_samples, n_test)
+    pair_indices = sorted(sample_rng.choice(n_test, size=sample_n, replace=False).tolist())
 
-    print(f"Val pairs: {n_val} total  ({len(pair_indices)} to explain)")
+    print(f"Test pairs: {n_test} total  ({len(pair_indices)} to explain)")
 
     return ExplainerContext(
         encoder=encoder,
@@ -736,19 +741,19 @@ def load_explainer_context(
         x=x,
         g=g,
         id2ent=id2ent,
-        ei_val=ei_val,
-        et_val=et_val,
+        ei_test=ei_test,
+        et_test=et_test,
         rel2id=rel2id,
         num_rel=num_rel,
-        val_pairs=val_pairs,
-        y_act_val=y_act_val,
-        y_time_val=y_time_val,
+        test_pairs=test_pairs,
+        y_act_test=y_act_test,
+        y_time_test=y_time_test,
         act_vocab=act_vocab,
         id2act=id2act,
         tasks=tasks,
         task_aliases=task_aliases,
         skipped_tasks=skipped_tasks,
-        n_val=n_val,
+        n_test=n_test,
         pair_indices=pair_indices,
         rng=rng,
     )
@@ -816,7 +821,7 @@ def get_classification_prediction(
 def write_summary_json(
     path: str,
     args: Any,
-    n_val: int,
+    n_test: int,
     pair_indices: List[int],
     tasks: List[str],
     extra_fields: Optional[Dict[str, Any]] = None,
@@ -826,9 +831,9 @@ def write_summary_json(
         "ttl": os.path.abspath(args.ttl),
         "model": os.path.abspath(args.model),
         "vocabs": os.path.abspath(args.vocabs) if getattr(args, "vocabs", None) else None,
-        "best_val": os.path.abspath(args.best_val) if getattr(args, "best_val", None) else None,
+        "best_test": os.path.abspath(args.best_test) if getattr(args, "best_test", None) else None,
         "out": os.path.abspath(args.out),
-        "num_val_pairs": n_val,
+        "num_test_pairs": n_test,
         "explained_pair_indices": pair_indices,
         "tasks": tasks,
         "seed": args.seed,

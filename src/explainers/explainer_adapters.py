@@ -1,4 +1,3 @@
-"""Active explainer adapters for the fidelity-curve pipeline."""
 
 from __future__ import annotations
 import hashlib
@@ -154,10 +153,10 @@ class BaselineAdapter:
         self.name = name
         self.seed = int(seed)
 
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         num_nodes = int(x_sub.size(0))
         if self.name == "random":
-            rng = np.random.default_rng(_stable_uint32_seed(self.seed, pair_val_idx, task))
+            rng = np.random.default_rng(_stable_uint32_seed(self.seed, pair_test_idx, task))
             scores = torch.tensor(rng.random(num_nodes).astype(np.float32), device=device)
             metadata = {"baseline": "random", "seed": self.seed}
         else:
@@ -171,7 +170,7 @@ class BaselineAdapter:
 
         return _result(
             self.name,
-            pair_val_idx,
+            pair_test_idx,
             task,
             src_local,
             dst_local,
@@ -182,7 +181,7 @@ class BaselineAdapter:
 
 class GradientAdapter:
     name = "gradient"
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.explain_gradient import _gradient_saliency
         try:
             _, grad_x_input_abs, pred_meta = _gradient_saliency(
@@ -195,7 +194,7 @@ class GradientAdapter:
                 task,
                 y_act,
                 y_time,
-                pair_val_idx,
+                pair_test_idx,
                 device,
                 use_model_target=use_model_target,
             )
@@ -205,7 +204,7 @@ class GradientAdapter:
                 return None
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 task,
                 src_local,
                 dst_local,
@@ -234,7 +233,7 @@ class LIMEAdapter:
         self.baseline = baseline
         self.global_mean = global_mean.detach().clone() if global_mean is not None else None
         self.rng = np.random.default_rng(seed)
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.explain_lime import (
             _neighbor_mask_graphlime_ridge,
             _structural_graphlime_candidates,
@@ -286,7 +285,7 @@ class LIMEAdapter:
                 model_task,
                 y_act,
                 y_time,
-                pair_val_idx,
+                pair_test_idx,
                 device,
                 self.n_perturb,
                 self.mask_frac,
@@ -307,7 +306,7 @@ class LIMEAdapter:
                 full_scores[nid] = float(candidate_scores[j])
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 task,
                 src_local,
                 dst_local,
@@ -341,7 +340,7 @@ class ShapAdapter:
         self.baseline = baseline
         self.global_mean = global_mean.detach().clone() if global_mean is not None else None
         self.rng = np.random.default_rng(seed)
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.explain_shap import (
             _build_predict_fn,
             _run_kernel_shap,
@@ -399,7 +398,7 @@ class ShapAdapter:
                 task=model_task,
                 y_act=y_act,
                 y_time=y_time,
-                pair_val_idx=pair_val_idx,
+                pair_test_idx=pair_test_idx,
                 device=device,
                 baseline_row=baseline_row,
                 pbar=None,
@@ -421,7 +420,7 @@ class ShapAdapter:
                 full_scores[local_id] = float(candidate_scores[j])
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 task,
                 src_local,
                 dst_local,
@@ -448,7 +447,7 @@ class IGAdapter:
         self.n_steps = n_steps
         self.method = method
         self.baseline = baseline
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.explain_ig import (
             _integrated_gradients,
             _resolve_fixed_model_target,
@@ -476,7 +475,7 @@ class IGAdapter:
                 task,
                 y_act,
                 y_time,
-                pair_val_idx,
+                pair_test_idx,
                 device,
                 baseline_tensor,
                 self.n_steps,
@@ -490,7 +489,7 @@ class IGAdapter:
                 return None
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 task,
                 src_local,
                 dst_local,
@@ -524,7 +523,7 @@ class FOXAdapter:
         self.epochs = epochs
         self.lr = lr
         self.rng = np.random.default_rng(seed)
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.explain_fox import _fox_explain
         try:
             feat_ids = _structural_candidate_ids(
@@ -547,7 +546,7 @@ class FOXAdapter:
                 task,
                 y_act,
                 y_time,
-                pair_val_idx,
+                pair_test_idx,
                 device,
                 n_perturb=self.n_perturb,
                 num_mfs=self.num_mfs,
@@ -565,7 +564,7 @@ class FOXAdapter:
                 return None
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 task,
                 src_local,
                 dst_local,
@@ -595,7 +594,7 @@ class GNNExplainerAdapter:
         self.node_ent = node_ent
         self.seed = seed
 
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.gnnexplainer_core import (
             GNNExplainerConfig,
             explain_gnnexplainer_masks,
@@ -617,7 +616,7 @@ class GNNExplainerAdapter:
                 edge_ent=self.edge_ent,
                 node_size=self.node_size,
                 node_ent=self.node_ent,
-                seed=gnnexplainer_seed(self.seed, pair_val_idx, model_task),
+                seed=gnnexplainer_seed(self.seed, pair_test_idx, model_task),
             )
             explanation = explain_gnnexplainer_masks(
                 encoder=encoder,
@@ -665,7 +664,7 @@ class GNNExplainerAdapter:
 
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 model_task,
                 src_local,
                 dst_local,
@@ -732,7 +731,7 @@ class PGMExplainerAdapter:
         self.significance_threshold = significance_threshold
         self.seed = seed
 
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.pgmexplainer_core import (
             PGMExplainerConfig,
             explain_pgmexplainer_nodes,
@@ -750,7 +749,7 @@ class PGMExplainerAdapter:
                 perturb_probability=self.perturb_probability,
                 response_top_fraction=self.response_top_fraction,
                 significance_threshold=self.significance_threshold,
-                seed=pgmexplainer_seed(self.seed, pair_val_idx, model_task),
+                seed=pgmexplainer_seed(self.seed, pair_test_idx, model_task),
             )
             explanation = explain_pgmexplainer_nodes(
                 encoder=encoder,
@@ -791,7 +790,7 @@ class PGMExplainerAdapter:
             ).reshape(-1).detach().cpu().tolist()
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 model_task,
                 src_local,
                 dst_local,
@@ -846,7 +845,7 @@ class ProphetAdapter:
         self.node_ent_reg = node_ent_reg
         self.seed = seed
 
-    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_val_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
+    def explain(self, encoder: torch.nn.Module, head: torch.nn.Module, x_sub: Tensor, ei_sub: Tensor, et_sub: Tensor, src_local: int, dst_local: int, task: str, y_act: Optional[Tensor], y_time: Optional[Tensor], pair_test_idx: int, device: torch.device, use_model_target: bool = True, protected_nodes: Sequence[int] = ()) -> Optional[ExplanationMask]:
         from src.explainers.prophet_core import (
             ProphetConfig,
             explain_prophet_masks,
@@ -866,7 +865,7 @@ class ProphetAdapter:
                 edge_ent_reg=self.edge_ent_reg,
                 node_size_reg=self.node_size_reg,
                 node_ent_reg=self.node_ent_reg,
-                seed=prophet_seed(self.seed, pair_val_idx, model_task),
+                seed=prophet_seed(self.seed, pair_test_idx, model_task),
             )
             explanation = explain_prophet_masks(
                 encoder=encoder,
@@ -908,7 +907,7 @@ class ProphetAdapter:
                 return None
             return _result(
                 self.name,
-                pair_val_idx,
+                pair_test_idx,
                 model_task,
                 src_local,
                 dst_local,

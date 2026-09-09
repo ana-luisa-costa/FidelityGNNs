@@ -1,4 +1,3 @@
-"""Standalone node-level PGMExplainer for R-GCN event-pair predictions."""
 
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ from src.explainers.pgmexplainer_core import (
     validate_classification_task,
 )
 from src.fidelity.fidelity_utils import task_target_value_nodes
-from src.train import _sanitize, get_event_attrs
+from src.gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -222,11 +221,11 @@ def main() -> None:
     skipped_rows: List[dict] = []
 
     for pair_idx in tqdm(context.pair_indices, desc="PGMExplainer pairs"):
-        src_global, dst_global = context.val_pairs[pair_idx]
+        src_global, dst_global = context.test_pairs[pair_idx]
         nodes, edge_index, edge_type, global_to_local = _k_hop_subgraph(
             seeds=[src_global, dst_global],
-            edge_index=context.ei_val,
-            edge_type=context.et_val,
+            edge_index=context.ei_test,
+            edge_type=context.et_test,
             num_nodes=context.x.size(0),
             k=args.pgm_subgraph_hop,
         )
@@ -375,7 +374,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "meta.json"),
         args,
-        context.n_val,
+        context.n_test,
         context.pair_indices,
         context.tasks,
         extra_fields={

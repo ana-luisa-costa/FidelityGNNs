@@ -1,4 +1,3 @@
-"""Stock PyG GNNExplainer integration for the basis-decomposed R-GCN."""
 
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ from torch_geometric.explain import Explainer, GNNExplainer
 from torch_geometric.explain.algorithm.utils import clear_masks, set_masks
 from torch_geometric.nn import RGCNConv
 
-from src.train import MultiTaskHead, RGCNEncoder, _sanitize
+from src.gnn4ppm.train import MultiTaskHead, RGCNEncoder, _sanitize
 
 
 _RESOURCE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_resource"

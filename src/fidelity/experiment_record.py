@@ -22,13 +22,13 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def write_selected_pairs(path: Path, pair_indices: Sequence[int], val_pairs: Sequence[Sequence[int]]) -> None:
+def write_selected_pairs(path: Path, pair_indices: Sequence[int], test_pairs: Sequence[Sequence[int]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["pair_idx", "src_id", "dst_id"])
         writer.writeheader()
         for pair_idx in pair_indices:
-            src_id, dst_id = val_pairs[pair_idx]
+            src_id, dst_id = test_pairs[pair_idx]
             writer.writerow({"pair_idx": pair_idx, "src_id": src_id, "dst_id": dst_id})
 
 

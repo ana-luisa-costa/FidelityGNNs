@@ -1,6 +1,3 @@
-"""
-Integrated Gradients explainer for the R-GCN event-pair model.
-"""
 
 from __future__ import annotations
 
@@ -32,7 +29,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.train import get_event_attrs
+from src.gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
 
@@ -166,7 +163,7 @@ def _make_forward_fn(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
     use_model_target: bool = False,
     fixed_target: Optional[dict] = None,
@@ -179,7 +176,7 @@ def _make_forward_fn(
         scalar = (
             _scalar_for_fixed_model_target(out, task, fixed_target or {})
             if use_model_target
-            else _scalar_for_task(out, task, y_act, y_time, pair_val_idx, device)
+            else _scalar_for_task(out, task, y_act, y_time, pair_test_idx, device)
         )
         return scalar.unsqueeze(0)             # [1]
 
@@ -199,7 +196,7 @@ def _integrated_gradients(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
     baseline: torch.Tensor,
     n_steps: int,
@@ -212,7 +209,7 @@ def _integrated_gradients(
 
     forward_fn = _make_forward_fn(
         encoder, head, ei, et, src_id,
-        task, y_act, y_time, pair_val_idx, device, use_model_target,
+        task, y_act, y_time, pair_test_idx, device, use_model_target,
         fixed_target=fixed_target,
     )
 
@@ -294,11 +291,11 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head    = ctx.encoder, ctx.head
     x, g, id2ent     = ctx.x, ctx.g, ctx.id2ent
-    ei_val, et_val   = ctx.ei_val, ctx.et_val
-    val_pairs        = ctx.val_pairs
-    y_act_val, y_time_val = ctx.y_act_val, ctx.y_time_val
+    ei_test, et_test   = ctx.ei_test, ctx.et_test
+    test_pairs        = ctx.test_pairs
+    y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
-    tasks, n_val, pair_indices = ctx.tasks, ctx.n_val, ctx.pair_indices
+    tasks, n_test, pair_indices = ctx.tasks, ctx.n_test, ctx.pair_indices
 
     os.makedirs(args.out, exist_ok=True)
     ig_dir   = os.path.join(args.out, "integrated_gradients")
@@ -310,7 +307,7 @@ def main() -> None:
     global_cat_rows: List[dict] = []   # for per-category aggregation at the end
 
     for pi in tqdm(pair_indices, desc="pairs"):
-        src_id, dst_id = val_pairs[pi]
+        src_id, dst_id = test_pairs[pi]
 
         # ------------------------------------------------------------------
         # k-hop subgraph extraction
@@ -318,8 +315,8 @@ def main() -> None:
         if args.ig_subgraph_hop > 0:
             nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph(
                 seeds=[src_id, dst_id],
-                edge_index=ei_val,
-                edge_type=et_val,
+                edge_index=ei_test,
+                edge_type=et_test,
                 num_nodes=x.size(0),
                 k=args.ig_subgraph_hop,
             )
@@ -332,8 +329,8 @@ def main() -> None:
         else:
             nodes_t    = torch.arange(x.size(0))
             x_sub      = x.detach()
-            ei_sub     = ei_val
-            et_sub     = et_val
+            ei_sub     = ei_test
+            et_sub     = et_test
             src_local  = src_id
             dst_local  = dst_id
             g2l        = None
@@ -364,9 +361,9 @@ def main() -> None:
                         et=et_sub,
                         src_id=src_local,
                         task=task,
-                        y_act=y_act_val,
-                        y_time=y_time_val,
-                        pair_val_idx=pi,
+                        y_act=y_act_test,
+                        y_time=y_time_test,
+                        pair_test_idx=pi,
                         device=device,
                         baseline=baseline_sub,
                         n_steps=args.ig_n_steps,
@@ -436,8 +433,8 @@ def main() -> None:
                         "sum_attributions":    sum_attributions,
                         "dst_activity":       act_label,
                     }
-                    if task == "activity" and y_act_val is not None:
-                        ya = int(y_act_val[pi].item())
+                    if task == "activity" and y_act_test is not None:
+                        ya = int(y_act_test[pi].item())
                         row["y_act_id"]   = ya
                         row["y_act_name"] = id2act.get(ya, "")
                     row.update(pred_meta)
@@ -549,7 +546,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "summary_ig.json"),
         args,
-        n_val,
+        n_test,
         pair_indices,
         tasks,
         extra_fields={

@@ -1,6 +1,3 @@
-"""
-GraphLIME explainability for the R-GCN event-pair model.
-"""
 
 from __future__ import annotations
 
@@ -34,7 +31,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.train import RGCNEncoder, _sanitize, get_event_attrs
+from src.gnn4ppm.train import RGCNEncoder, _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -104,7 +101,7 @@ def _neighbor_mask_graphlime_ridge(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
     n_perturb: int,
     mask_frac: float,
@@ -143,7 +140,7 @@ def _neighbor_mask_graphlime_ridge(
             elif use_model_target:
                 t = _scalar_for_model_task(out, task)
             else:
-                t = _scalar_for_task(out, task, y_act, y_time, pair_val_idx, device)
+                t = _scalar_for_task(out, task, y_act, y_time, pair_test_idx, device)
             return float(t.item())
 
     keep_all = np.ones(K, dtype=np.float64)
@@ -284,11 +281,11 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_val, et_val = ctx.ei_val, ctx.et_val
-    val_pairs = ctx.val_pairs
-    y_act_val, y_time_val = ctx.y_act_val, ctx.y_time_val
+    ei_test, et_test = ctx.ei_test, ctx.et_test
+    test_pairs = ctx.test_pairs
+    y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
-    tasks, n_val, pair_indices = ctx.tasks, ctx.n_val, ctx.pair_indices
+    tasks, n_test, pair_indices = ctx.tasks, ctx.n_test, ctx.pair_indices
     rng = ctx.rng
     vocabs = load_vocabs(args.vocabs) if args.vocabs else {}
     resource_vocab = vocabs.get("c_vocabs", {}).get(_RESOURCE_OTHERC_RAW_KEY, {})
@@ -308,13 +305,13 @@ def main() -> None:
     )
 
     for pi in tqdm(pair_indices, desc="pairs"):
-        src_id, dst_id = val_pairs[pi]
-        pair_val_idx = pi
+        src_id, dst_id = test_pairs[pi]
+        pair_test_idx = pi
 
         nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph( #DEMO1 extract the k-hop subgraph around the source and destination entities of the pair
             seeds=[src_id, dst_id],
-            edge_index=ei_val,
-            edge_type=et_val,
+            edge_index=ei_test,
+            edge_type=et_test,
             num_nodes=x.size(0),
             k=max(0, int(args.k_hop)),
         )
@@ -382,9 +379,9 @@ def main() -> None:
                     src_local,
                     feat_ids,
                     model_task,
-                    y_act_val,
-                    y_time_val,
-                    pair_val_idx,
+                    y_act_test,
+                    y_time_test,
+                    pair_test_idx,
                     device,
                     n_perturb=args.graphlime_perturbations,
                     mask_frac=float(args.graphlime_mask_fraction),
@@ -445,7 +442,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "summary.json"),
         args,
-        n_val,
+        n_test,
         pair_indices,
         tasks,
         extra_fields={

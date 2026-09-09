@@ -1,7 +1,3 @@
-"""
-KernelSHAP entity-level explainer for the R-GCN event-pair model.
-"""
-
 
 from __future__ import annotations
 
@@ -34,7 +30,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.train import _sanitize, get_event_attrs
+from src.gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -132,7 +128,7 @@ def _build_predict_fn(
     task: str,
     y_act: Optional[torch.Tensor],
     y_time: Optional[torch.Tensor],
-    pair_val_idx: int,
+    pair_test_idx: int,
     device: torch.device,
     baseline_row: torch.Tensor,
     pbar: Optional[tqdm] = None,
@@ -168,7 +164,7 @@ def _build_predict_fn(
                 elif use_model_target:
                     val = _scalar_for_model_task(out, task)
                 else:
-                    val = _scalar_for_task(out, task, y_act, y_time, pair_val_idx, device)
+                    val = _scalar_for_task(out, task, y_act, y_time, pair_test_idx, device)
                 out_vals[r] = float(val.item())
         if pbar is not None:
             pbar.update(masks.shape[0])
@@ -312,11 +308,11 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_val, et_val = ctx.ei_val, ctx.et_val
-    val_pairs = ctx.val_pairs
-    y_act_val, y_time_val = ctx.y_act_val, ctx.y_time_val
+    ei_test, et_test = ctx.ei_test, ctx.et_test
+    test_pairs = ctx.test_pairs
+    y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
-    tasks, n_val, pair_indices = ctx.tasks, ctx.n_val, ctx.pair_indices
+    tasks, n_test, pair_indices = ctx.tasks, ctx.n_test, ctx.pair_indices
     vocabs = load_vocabs(args.vocabs) if args.vocabs else {}
     otherc_id2label = _otherc_id2label_by_key(vocabs)
 
@@ -334,13 +330,13 @@ def main() -> None:
     summary_rows: List[dict] = []
 
     for pi in tqdm(pair_indices, desc="pairs"):
-        src_id, dst_id = val_pairs[pi]
+        src_id, dst_id = test_pairs[pi]
 
         if args.shap_subgraph_hop > 0:
             nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph(
                 seeds=[src_id, dst_id],
-                edge_index=ei_val,
-                edge_type=et_val,
+                edge_index=ei_test,
+                edge_type=et_test,
                 num_nodes=x.size(0),
                 k=args.shap_subgraph_hop,
             )
@@ -351,7 +347,7 @@ def main() -> None:
             dst_local = g2l[dst_id]
         else:
             nodes_t = torch.arange(x.size(0))
-            ei_sub, et_sub, x_sub = ei_val, et_val, x
+            ei_sub, et_sub, x_sub = ei_test, et_test, x
             src_local, dst_local = src_id, dst_id
             g2l = None
 
@@ -393,8 +389,8 @@ def main() -> None:
                     encoder=encoder, head=head,
                     x_sub=x_sub, ei_sub=ei_sub, et_sub=et_sub,
                     src_local=src_local, feat_ids_local=feat_ids_local,
-                    task=model_task, y_act=y_act_val, y_time=y_time_val,
-                    pair_val_idx=pi, device=device,
+                    task=model_task, y_act=y_act_test, y_time=y_time_test,
+                    pair_test_idx=pi, device=device,
                     baseline_row=baseline_rows[shap_baseline], pbar=pbar,
                     use_model_target=True,
                     pred_meta=pred_meta,
@@ -469,7 +465,7 @@ def main() -> None:
     write_summary_json(
         os.path.join(args.out, "summary_shap.json"),
         args,
-        n_val,
+        n_test,
         pair_indices,
         tasks,
         extra_fields={

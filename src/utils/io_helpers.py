@@ -20,7 +20,15 @@ def load_embeddings(path: str) -> torch.Tensor:
 def load_case_split(split_path: str) -> Tuple[set, set]:
     with open(split_path, encoding="utf-8") as f:
         d = json.load(f)
-    return set(d["train"]), set(d["val"])
+    if "test" in d:
+        held_out = d["test"]
+    elif "val" in d:
+        held_out = d["val"]
+    else:
+        raise KeyError(
+            f"{split_path} has neither 'test' nor 'val' key (found: {list(d.keys())})"
+        )
+    return set(d["train"]), set(held_out)
 
 
 def load_case_split_from_csv(csv_path: str, train_ratio: float = 0.8, seed: int = 42, temporal: bool = False):
@@ -55,9 +63,9 @@ def load_case_split_from_csv(csv_path: str, train_ratio: float = 0.8, seed: int 
     n = len(unique_cases)
     split = int(n * train_ratio)
     train_cases = set(unique_cases[:split])
-    val_cases = set(unique_cases[split:])
-    print(f"Case split ({split_mode}): {len(train_cases)} train / {len(val_cases)} val  (total {n})")
-    return train_cases, val_cases, unique_cases
+    test_cases = set(unique_cases[split:])
+    print(f"Case split ({split_mode}): {len(train_cases)} train / {len(test_cases)} test  (total {n})")
+    return train_cases, test_cases, unique_cases
 
 
 def load_pt(path: str) -> dict:

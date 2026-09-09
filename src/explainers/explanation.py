@@ -1,4 +1,3 @@
-"""Shared explanation container used by explainers and fidelity evaluation."""
 
 from __future__ import annotations
 
@@ -11,8 +10,6 @@ from torch import Tensor
 
 @dataclass
 class ExplanationResult:
-    """Normalized explanation result for one explainer, pair, and task."""
-
     explainer: str
     pair_idx: int
     task: str

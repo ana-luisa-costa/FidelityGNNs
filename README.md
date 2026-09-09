@@ -1,6 +1,6 @@
 ## Overview
 
-FidelityGNNs is a systematic benchmark for GNN explanations in PPM based on fidelity. It includes the architecture of a GNN model in src/gnn4ppm, several explanation methods applied for GNNs in src/explainers, fidelity permutation conputations in src/fidelity, and benchmarks performed in src/benchmark. This repository supports the publication "Fidelity Benchmark for GNN Explanations in Predictive Process Monitoring".
+FidelityGNNs is a systematic benchmark for GNN explanations in PPM based on fidelity. It includes the architecture of a GNN model in src/gnn4ppm, several explanation methods applied for GNNs in src/explainers, fidelity permutation computations in src/fidelity, and benchmarks performed in src/benchmark. This repository supports the publication "Fidelity Benchmark for GNN Explanations in Predictive Process Monitoring".
 
 ## Setup
 

@@ -8,6 +8,7 @@ from typing import Iterable
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
@@ -34,6 +35,11 @@ MODE_DIR_BASE = {
     "Middle": "fidelity_curves_middle",
     "Full": "fidelity_curves_full",
 }
+
+_SCORE_VMIN, _SCORE_VMAX = 0.0, 0.85
+_SCORE_CMAP = LinearSegmentedColormap.from_list(
+    "light_greys", plt.cm.Greys(np.linspace(0.0, 0.33, 256))
+)
 
 
 def _mode_dir(level: str, dir_suffix: str = "") -> str:
@@ -224,29 +230,37 @@ def _axis_limits(values: pd.Series, mode: str) -> tuple[float, float]:
     return max(0.0, lo - pad), min(1.0, hi + pad)
 
 
-def _add_score_contours(ax: plt.Axes, xlim: tuple, ylim: tuple) -> None:
+def _add_score_contours(ax: plt.Axes, xlim: tuple, ylim: tuple):
     x = np.linspace(max(xlim[0], 1e-6), xlim[1], 300)
     y = np.linspace(max(ylim[0], 1e-6), ylim[1], 300)
     xx, yy = np.meshgrid(x, y)
     score = np.sqrt(xx * yy)
+
+    filled = ax.contourf(
+        xx, yy, score, levels=np.linspace(_SCORE_VMIN, _SCORE_VMAX, 18),
+        cmap=_SCORE_CMAP, vmin=_SCORE_VMIN, vmax=_SCORE_VMAX,
+        extend="max", zorder=0,
+    )
+
     lo, hi = float(score.min()), float(score.max())
     candidates = np.arange(np.ceil(lo / 0.05) * 0.05, np.floor(hi / 0.05) * 0.05 + 0.001, 0.05)
     levels = candidates[(candidates > lo) & (candidates < hi)]
     if len(levels) == 0:
         levels = np.linspace(lo, hi, 4)[1:-1]
     contours = ax.contour(xx, yy, score, levels=levels, colors="#98A2B3",
-                          linewidths=0.6, linestyles="--", alpha=0.7, zorder=0)
+                          linewidths=0.6, linestyles="--", alpha=0.7, zorder=1)
     ax.clabel(contours, inline=True, fontsize=7, fmt=lambda v: f"S={v:.2f}", colors="#667085")
+    return filled
 
 
-def _plot_dataset(ax: plt.Axes, frame: pd.DataFrame, title: str, axis_mode: str) -> None:
+def _plot_dataset(ax: plt.Axes, frame: pd.DataFrame, title: str, axis_mode: str):
     present_levels = [l for l in LEVELS if l in frame["heterogeneity"].values]
 
     xlim = _axis_limits(frame["necessity"], axis_mode)
     ylim = _axis_limits(frame["sufficiency"], axis_mode)
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
-    _add_score_contours(ax, xlim, ylim)
+    filled = _add_score_contours(ax, xlim, ylim)
 
     explainers = _ordered_explainers(frame["explainer"])
     for idx, explainer in enumerate(explainers):
@@ -277,6 +291,7 @@ def _plot_dataset(ax: plt.Axes, frame: pd.DataFrame, title: str, axis_mode: str)
     ax.set_xlabel("Necessity", fontsize=10)
     ax.set_ylabel("Sufficiency", fontsize=10)
     ax.tick_params(labelsize=9)
+    return filled
 
 
 def _build_legend_handles(all_explainers: list[str], present_levels: list[str]) -> tuple:
@@ -327,9 +342,12 @@ def _render_figure(
             if lv in df["heterogeneity"].values and lv not in all_levels:
                 all_levels.append(lv)
 
+    score_mappable = None
     for i, (name, df) in enumerate(data.items()):
         row, col = divmod(i, ncols)
-        _plot_dataset(axes[row][col], df, name, axis_mode)
+        filled = _plot_dataset(axes[row][col], df, name, axis_mode)
+        if score_mappable is None:
+            score_mappable = filled
 
     for j in range(n, nrows * ncols):
         row, col = divmod(j, ncols)

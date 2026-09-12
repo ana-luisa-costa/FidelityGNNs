@@ -83,9 +83,13 @@ def _parse_args() -> argparse.Namespace:
         "--saturation-dataset", default=None,
         help=(
             "If set, skip the normal cross-dataset plots and instead produce a "
-            "single necessity-vs-k saturation plot for this one dataset, reading "
+            "single necessity-vs-k (or sufficiency-vs-k) saturation plot, reading "
             "a fine-grained top_k sweep (e.g. k=1..25) from "
-            "<input>/<dataset>/<saturation-dir>/fidelity_curves_summary.csv."
+            "<input>/<dataset>/<saturation-dir>/fidelity_curves_summary.csv. "
+            "Pass a dataset name for a single-dataset plot, or 'all' to average "
+            "mean_fid_prob_plus/minus per (explainer, top_k) across every dataset "
+            "that has the sweep (each dataset weighted equally) and plot one "
+            "combined curve per explainer."
         ),
     )
     parser.add_argument(
@@ -96,6 +100,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--saturation-task", default="activity",
         help="Task to plot in the saturation figure (default: activity).",
+    )
+    parser.add_argument(
+        "--saturation-metric", default="necessity", choices=("necessity", "sufficiency"),
+        help=(
+            "Which fidelity component to plot in the saturation figure: "
+            "'necessity' (mean_fid_prob_plus, default) or 'sufficiency' "
+            "(mean_one_minus_fid_prob_minus)."
+        ),
     )
     parser.add_argument(
         "--saturation-tol", type=float, default=0.05,
@@ -648,24 +660,83 @@ def _load_ks_summary(input_dir: Path, dataset: str, saturation_dir: str, task: s
     return summary
 
 
-def _plot_necessity_saturation(
+def _load_ks_summary_all_datasets(
+    input_dir: Path, saturation_dir: str, task: str,
+) -> tuple[pd.DataFrame, Sequence[str]]:
+    frames = []
+    included = []
+    for dataset in DATASETS:
+        summary_path = input_dir / dataset / saturation_dir / "fidelity_curves_summary.csv"
+        if not summary_path.is_file():
+            warnings.warn(f"Missing {summary_path}; skipping {dataset}")
+            continue
+        summary = pd.read_csv(summary_path)
+        resolved = _resolve_task(sorted(summary["task"].astype(str).unique()), task)
+        if resolved is None:
+            warnings.warn(f"{dataset}: no rows for task {task!r}; skipping")
+            continue
+        part = summary[summary["task"].astype(str) == resolved].copy()
+        if part.empty:
+            continue
+        part["task"] = resolved
+        frames.append(part)
+        included.append(dataset)
+
+    if not frames:
+        raise ValueError(f"No datasets contain task {task!r} under {saturation_dir!r}")
+
+    combined = pd.concat(frames, ignore_index=True)
+    value_cols = [c for c in ("mean_fid_prob_plus", "mean_fid_prob_minus") if c in combined.columns]
+    averaged = (
+        combined.groupby(["explainer", "top_k"], as_index=False)[value_cols]
+        .mean()
+    )
+    averaged["task"] = str(combined["task"].iloc[0])
+    return averaged, included
+
+
+def _necessity_component(raw: np.ndarray) -> np.ndarray:
+    """a = min(1, max(0, Fid+)), applied pointwise at each k."""
+    return np.clip(raw, 0.0, 1.0)
+
+
+def _identity_component(raw: np.ndarray) -> np.ndarray:
+    return raw
+
+
+_SATURATION_METRICS = {
+    # necessity: a(k) = min(1, max(0, Fid+(k))) -- rises toward 1 as k grows.
+    "necessity": ("mean_fid_prob_plus", _necessity_component, "Mean necessity component", "necessity"),
+    # sufficiency: raw, unflipped Fid-(k) -- the drop in prediction probability
+    # when keeping ONLY the top-k nodes. Decays toward 0 as k grows (more of
+    # the graph is retained, so the prediction converges back to the
+    # original). Lower = more sufficient. Note this is *not* the same as the
+    # 1-|Fid-| "goodness" score used for the aggregate necessity/sufficiency
+    # score elsewhere in this repo (e.g. benchmark_1_overall_score.py) -- that
+    # score is bounded to [0, 1] and necessarily rises with k for the same
+    # reason this raw curve falls.
+    "sufficiency": ("mean_fid_prob_minus", _identity_component, "Mean fidelity− (sufficiency) component", "sufficiency"),
+}
+
+
+def _plot_saturation(
     summary: pd.DataFrame,
     dataset: str,
     task_label: str,
     tol: float,
     out_dir: Path,
     formats: Sequence[str],
+    metric: str = "necessity",
+    stem_label: str | None = None,
 ) -> None:
-    """Mean necessity (Fidelity+) vs explanation size k for one dataset, one
-    panel, one line per explainer, with each curve's saturation point
-    highlighted (larger marker + k label)."""
+    value_col, transform, ylabel, metric_label = _SATURATION_METRICS[metric]
     fig, ax = plt.subplots(figsize=(9, 6.5))
 
     methods = [m for m in METHODS if m in set(summary["explainer"])]
     for method in methods:
         rows = summary[summary["explainer"] == method].sort_values("top_k")
         k = rows["top_k"].to_numpy(dtype=int)
-        y = rows["mean_fid_prob_plus"].to_numpy(dtype=float)
+        y = transform(rows[value_col].to_numpy(dtype=float))
         color = METHOD_COLORS.get(method, "0.3")
 
         ax.plot(k, y, color=color, linewidth=1.6, marker="o", markersize=5, zorder=2)
@@ -683,7 +754,7 @@ def _plot_necessity_saturation(
         )
 
     ax.set_xlabel("Explanation size k")
-    ax.set_ylabel("Mean necessity component")
+    ax.set_ylabel(ylabel)
     ax.set_xlim(float(summary["top_k"].min()), float(summary["top_k"].max()))
     ax.grid(True, linewidth=0.6)
 
@@ -695,20 +766,50 @@ def _plot_necessity_saturation(
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
                bbox_to_anchor=(0.5, 1.06), fontsize=11)
     fig.suptitle(
-        f"{dataset} — necessity saturation vs. explanation size ({task_label})",
+        f"{dataset} — {metric_label} saturation vs. explanation size ({task_label})",
         fontsize=13, y=1.14,
     )
     fig.tight_layout()
-    stem = f"{_safe_stem(dataset)}_{_safe_stem(task_label)}_necessity_saturation"
+    stem = f"{_safe_stem(stem_label or dataset)}_{_safe_stem(task_label)}_{metric_label}_saturation"
     _save(fig, out_dir, stem, formats)
+
+
+def _export_saturation_csv(
+    summary: pd.DataFrame, out_dir: Path, stem_label: str, task_label: str,
+    datasets_averaged: Sequence[str] | None = None,
+) -> None:
+    cols = ["explainer", "top_k", "task", "mean_fid_prob_plus", "mean_fid_prob_minus"]
+    export = summary[[c for c in cols if c in summary.columns]].sort_values(["explainer", "top_k"]).copy()
+    if datasets_averaged is not None:
+        export["datasets_averaged"] = ", ".join(datasets_averaged)
+    csv_path = out_dir / f"{_safe_stem(stem_label)}_{_safe_stem(task_label)}_saturation_data.csv"
+    export.to_csv(csv_path, index=False)
+    print(f"Saved {csv_path}")
 
 
 def _run_saturation(args: argparse.Namespace, formats: Sequence[str]) -> None:
     dataset = args.saturation_dataset
-    summary = _load_ks_summary(args.input, dataset, args.saturation_dir, args.saturation_task)
     _setup_style()
-    task_label = str(summary["task"].iloc[0])
-    _plot_necessity_saturation(summary, dataset, task_label, args.saturation_tol, args.out, formats)
+    if str(dataset).strip().lower() == "all":
+        summary, included = _load_ks_summary_all_datasets(
+            args.input, args.saturation_dir, args.saturation_task
+        )
+        task_label = str(summary["task"].iloc[0])
+        dataset_label = f"All datasets (n={len(included)}, average)"
+        print(f"Averaging over: {', '.join(included)}")
+        _export_saturation_csv(summary, args.out, "all_datasets", task_label, datasets_averaged=included)
+        _plot_saturation(
+            summary, dataset_label, task_label, args.saturation_tol, args.out, formats,
+            metric=args.saturation_metric, stem_label="all_datasets",
+        )
+    else:
+        summary = _load_ks_summary(args.input, dataset, args.saturation_dir, args.saturation_task)
+        task_label = str(summary["task"].iloc[0])
+        _export_saturation_csv(summary, args.out, dataset, task_label)
+        _plot_saturation(
+            summary, dataset, task_label, args.saturation_tol, args.out, formats,
+            metric=args.saturation_metric,
+        )
 
 
 def main() -> None:

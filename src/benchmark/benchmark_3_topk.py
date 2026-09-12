@@ -1,9 +1,3 @@
-"""Benchmark 3: fidelity vs. explanation size k, across datasets.
-
-Creates cross-dataset probability-fidelity plots (Fidelity+/Fidelity-, AUC,
-combined score) as a function of the top-k explanation size, from each
-dataset's fidelity_curves_full/ (or merged/) outputs.
-"""
 
 from __future__ import annotations
 
@@ -19,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from benchmark_4_targets import METHOD_COLORS
 
 DEFAULT_INPUT = Path("data/processed")
 DEFAULT_OUTPUT = Path("results/benchmark_3")
@@ -83,6 +78,32 @@ def _parse_args() -> argparse.Namespace:
         "--dir-suffix", default="",
         help="Suffix appended to the fidelity_curves_full/ (or merged/) folder name, "
              "e.g. '_n20' to read fidelity_curves_full_n20/.",
+    )
+    parser.add_argument(
+        "--saturation-dataset", default=None,
+        help=(
+            "If set, skip the normal cross-dataset plots and instead produce a "
+            "single necessity-vs-k saturation plot for this one dataset, reading "
+            "a fine-grained top_k sweep (e.g. k=1..25) from "
+            "<input>/<dataset>/<saturation-dir>/fidelity_curves_summary.csv."
+        ),
+    )
+    parser.add_argument(
+        "--saturation-dir", default="fidelity_ks",
+        help="Subfolder under <input>/<saturation-dataset>/ holding the fine-grained "
+             "fidelity_curves_summary.csv (default: fidelity_ks).",
+    )
+    parser.add_argument(
+        "--saturation-task", default="activity",
+        help="Task to plot in the saturation figure (default: activity).",
+    )
+    parser.add_argument(
+        "--saturation-tol", type=float, default=0.05,
+        help=(
+            "Saturation tolerance, as a fraction of each explainer's observed "
+            "necessity range. The saturation point is the smallest k after which "
+            "the curve stays within this band of its value at the largest k."
+        ),
     )
     return parser.parse_args()
 
@@ -592,12 +613,114 @@ def _plot_fidelity_comparison_topk(
     _save(fig, out_dir, stem, formats)
 
 
+def _saturation_point(k_values: np.ndarray, y_values: np.ndarray, tol: float) -> int:
+    """Smallest k after which the curve stays within `tol` (a fraction of the
+    curve's own observed range) of its value at the largest k. This is a
+    settling-time style definition: an early value close to the final one
+    doesn't count unless the curve stays there for the rest of the sweep.
+    Falls back to the last k if the curve never settles within tolerance.
+    """
+    if len(k_values) == 0:
+        raise ValueError("empty curve")
+    final = y_values[-1]
+    y_range = float(y_values.max() - y_values.min())
+    band = tol * y_range if y_range > 0 else tol
+    for i in range(len(k_values)):
+        if np.all(np.abs(y_values[i:] - final) <= band):
+            return int(k_values[i])
+    return int(k_values[-1])
+
+
+def _load_ks_summary(input_dir: Path, dataset: str, saturation_dir: str, task: str) -> pd.DataFrame:
+    summary_path = input_dir / dataset / saturation_dir / "fidelity_curves_summary.csv"
+    if not summary_path.is_file():
+        raise ValueError(f"Missing {summary_path}")
+    summary = pd.read_csv(summary_path)
+    resolved = _resolve_task(sorted(summary["task"].astype(str).unique()), task)
+    if resolved is None:
+        raise ValueError(
+            f"{summary_path}: no rows for task {task!r}; "
+            f"available={sorted(summary['task'].astype(str).unique())}"
+        )
+    summary = summary[summary["task"].astype(str) == resolved].copy()
+    if summary.empty:
+        raise ValueError(f"{summary_path}: empty after filtering to task {resolved!r}")
+    return summary
+
+
+def _plot_necessity_saturation(
+    summary: pd.DataFrame,
+    dataset: str,
+    task_label: str,
+    tol: float,
+    out_dir: Path,
+    formats: Sequence[str],
+) -> None:
+    """Mean necessity (Fidelity+) vs explanation size k for one dataset, one
+    panel, one line per explainer, with each curve's saturation point
+    highlighted (larger marker + k label)."""
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+
+    methods = [m for m in METHODS if m in set(summary["explainer"])]
+    for method in methods:
+        rows = summary[summary["explainer"] == method].sort_values("top_k")
+        k = rows["top_k"].to_numpy(dtype=int)
+        y = rows["mean_fid_prob_plus"].to_numpy(dtype=float)
+        color = METHOD_COLORS.get(method, "0.3")
+
+        ax.plot(k, y, color=color, linewidth=1.6, marker="o", markersize=5, zorder=2)
+
+        sat_k = _saturation_point(k, y, tol)
+        sat_idx = int(np.searchsorted(k, sat_k))
+        ax.scatter(
+            k[sat_idx], y[sat_idx],
+            color=color, s=170, zorder=4, edgecolor="white", linewidth=1.0,
+        )
+        ax.annotate(
+            str(sat_k), (k[sat_idx], y[sat_idx]),
+            xytext=(0, 9), textcoords="offset points",
+            ha="center", fontsize=10, fontweight="bold", color="0.15",
+        )
+
+    ax.set_xlabel("Explanation size k")
+    ax.set_ylabel("Mean necessity component")
+    ax.set_xlim(float(summary["top_k"].min()), float(summary["top_k"].max()))
+    ax.grid(True, linewidth=0.6)
+
+    handles = [
+        plt.Line2D([0], [0], color=METHOD_COLORS.get(m, "0.3"), marker="o",
+                   markersize=6, linewidth=1.6, label=METHOD_LABELS[m])
+        for m in methods
+    ]
+    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
+               bbox_to_anchor=(0.5, 1.06), fontsize=11)
+    fig.suptitle(
+        f"{dataset} — necessity saturation vs. explanation size ({task_label})",
+        fontsize=13, y=1.14,
+    )
+    fig.tight_layout()
+    stem = f"{_safe_stem(dataset)}_{_safe_stem(task_label)}_necessity_saturation"
+    _save(fig, out_dir, stem, formats)
+
+
+def _run_saturation(args: argparse.Namespace, formats: Sequence[str]) -> None:
+    dataset = args.saturation_dataset
+    summary = _load_ks_summary(args.input, dataset, args.saturation_dir, args.saturation_task)
+    _setup_style()
+    task_label = str(summary["task"].iloc[0])
+    _plot_necessity_saturation(summary, dataset, task_label, args.saturation_tol, args.out, formats)
+
+
 def main() -> None:
     args = _parse_args()
     formats = tuple(item.strip().lower() for item in args.formats.split(",") if item.strip())
     if not formats:
         raise ValueError("--formats must contain at least one format")
     args.out.mkdir(parents=True, exist_ok=True)
+
+    if args.saturation_dataset:
+        _run_saturation(args, formats)
+        return
 
     tasks = CANONICAL_TASKS if str(args.task).strip().lower() == "all" else (args.task,)
     for task in tasks:

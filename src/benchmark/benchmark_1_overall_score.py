@@ -1,26 +1,3 @@
-"""Benchmark 1: overall fidelity score S_E per explainer.
-
-Consumes results/benchmark_4/target_profile_scores.csv (produced by
-benchmark_4_targets.py) plus data/processed/<dataset>/evaluation.txt and the
-raw curve checkpoints (data/processed/<dataset>/fidelity_curves_full/curve_checkpoint.csv),
-and emits everything related to the overall score S_E and prediction
-performance:
-
-  - explainer_summary.csv        mean score, mean rank, wins per explainer
-  - overall_heatmap.{fmt}        explainer x dataset heatmap of Overall S_E
-  - explainer_boxplot.{fmt}      distribution of Overall S_E per explainer
-  - per_target_heatmap.{fmt}     explainer x target mean S_{E,q}
-  - prediction_performance.csv   model accuracy/F1 per dataset and target
-  - prediction_performance.{fmt} heatmap of model accuracy per dataset/target
-  - prediction_vs_fidelity.{fmt} scatter of model accuracy vs S_{E,q}
-  - explainer_rank_heatmap.{fmt}          per-dataset rank of each explainer
-  - explainer_pairwise_wins.{fmt}         head-to-head win counts across datasets
-  - explainer_necessity_sufficiency.{fmt} decomposition of S_E into its two factors
-  - explainer_necessity_sufficiency.csv
-
-Run benchmark_4_targets.py first to produce target_profile_scores.csv.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -236,7 +213,7 @@ def _plot_explainer_boxplot(
         ax.text(
             i,
             ax.get_ylim()[0],
-            f"rank {mean_rank.get(explainer, np.nan):.1f}",
+            f"MR {mean_rank.get(explainer, np.nan):.1f}",
             ha="center",
             va="bottom",
             fontsize=7,
@@ -245,7 +222,6 @@ def _plot_explainer_boxplot(
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([METHOD_LABELS.get(e, e) for e in order.index], rotation=20, ha="right")
     ax.set_ylabel("Overall $S_E$ across datasets")
-    ax.set_title("Distribution of Overall $S_E$ per explainer (label: mean rank, 1=best)", fontsize=10)
     ax.grid(True, axis="y", alpha=0.3, linewidth=0.5)
     fig.tight_layout()
     _save(fig, out_dir, "explainer_boxplot", formats)

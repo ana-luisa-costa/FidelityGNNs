@@ -1,15 +1,3 @@
-"""Benchmark 2: fidelity under graph heterogeneity (homogeneous/middle/full).
-
-Plots necessity-sufficiency trajectories across heterogeneity levels for all
-available BPIC datasets in one figure, per prediction target.
-
-Auto-discovers datasets under --data-dir by looking for fidelity_curves_<mode>/
-subdirectories. Datasets with at least two modes (middle + full) are included.
-
-Usage:
-    python src/benchmark/benchmark_2_heterogeneity.py
-    python src/benchmark/benchmark_2_heterogeneity.py --data-dir data/processed --output results/benchmark_2/all.pdf
-"""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +12,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
+from benchmark_4_targets import METHOD_COLORS as COLORS
 
 LEVELS = ("Homogeneous", "Middle", "Full")
 LEVEL_MARKERS = {"Homogeneous": "s", "Middle": "D", "Full": "o"}
@@ -38,14 +27,6 @@ DISPLAY_NAMES = {
     "shap": "SHAP",
     "pgmexplainer": "PGMExplainer",
     "gnnexplainer": "GNNExplainer",
-}
-COLORS = {
-    "gradient": "#0072B2",
-    "ig": "#56B4E9",
-    "lime": "#009E73",
-    "shap": "#CC79A7",
-    "pgmexplainer": "#E69F00",
-    "gnnexplainer": "#D55E00",
 }
 
 MODE_DIR_BASE = {
@@ -63,14 +44,6 @@ AUC_REQUIRED = {
     "explainer", "task",
     "auc_fid_prob_plus_raw", "auc_fid_prob_plus_normalized",
     "auc_fid_prob_minus_raw", "auc_fid_prob_minus_normalized",
-}
-SUMMARY_REQUIRED = {
-    "explainer", "task", "top_k",
-    "mean_fid_prob_plus", "mean_fid_prob_minus",
-}
-CHECKPOINT_REQUIRED = {
-    "explainer", "task", "top_k",
-    "fid_prob_plus", "fid_prob_minus",
 }
 
 
@@ -152,56 +125,18 @@ def _load_auc(path: Path) -> pd.DataFrame:
     return df
 
 
-def _load_summary(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    missing = sorted(SUMMARY_REQUIRED - set(df.columns))
-    if missing:
-        raise ValueError(f"{path}: missing columns {missing}")
-    return df
-
-
-def _load_checkpoint(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    missing = sorted(CHECKPOINT_REQUIRED - set(df.columns))
-    if missing:
-        raise ValueError(f"{path}: missing columns {missing}")
-    return df
-
-
 def _validate_and_load_condition(dataset_dir: Path, level: str, dir_suffix: str = "") -> pd.DataFrame | None:
     mode_dir = dataset_dir / _mode_dir(level, dir_suffix)
     auc_path = mode_dir / "fidelity_curves_auc.csv"
     summary_path = mode_dir / "fidelity_curves_summary.csv"
     checkpoint_path = mode_dir / "curve_checkpoint.csv"
 
+    # summary/checkpoint aren't read here, just required to exist as a signal
+    # that the compute_fidelity_curves run for this mode actually finished.
     if not all(p.exists() for p in (auc_path, summary_path, checkpoint_path)):
         return None
 
     auc = _load_auc(auc_path)
-    summary = _load_summary(summary_path)
-    checkpoint = _load_checkpoint(checkpoint_path)
-
-    # Recompute AUC from summary to validate
-    integrations = []
-    for (explainer, task), group in summary.groupby(["explainer", "task"]):
-        group = group.sort_values("top_k")
-        k = group["top_k"].to_numpy(dtype=float)
-        if len(k) < 2:
-            continue
-        integrations.append({
-            "explainer": explainer,
-            "task": task,
-            "recomputed_plus": np.trapz(group["mean_fid_prob_plus"].to_numpy(dtype=float), k),
-            "recomputed_minus": np.trapz(group["mean_fid_prob_minus"].to_numpy(dtype=float), k),
-        })
-
-    integrated = auc.merge(pd.DataFrame(integrations), on=["explainer", "task"], how="left")
-    tol = 1e-6
-    plus_err = (integrated["auc_fid_prob_plus_raw"] - integrated["recomputed_plus"]).abs().max()
-    minus_err = (integrated["auc_fid_prob_minus_raw"] - integrated["recomputed_minus"]).abs().max()
-    if plus_err > tol or minus_err > tol:
-        print(f"  Warning: {level} AUC mismatch for {dataset_dir.name} "
-              f"(plus_err={plus_err:.2e}, minus_err={minus_err:.2e})")
 
     result = auc.copy()
     result["heterogeneity"] = level
@@ -402,19 +337,19 @@ def _render_figure(
 
     exp_handles, lvl_handles = _build_legend_handles(all_explainers, all_levels)
     fig.legend(handles=exp_handles, title="Explainer", loc="lower center",
-               ncol=len(all_explainers), bbox_to_anchor=(0.5, 0.075),
-               frameon=False, fontsize=8, title_fontsize=9)
-    fig.legend(handles=lvl_handles, title="Graph representation",
+               ncol=len(all_explainers), bbox_to_anchor=(0.40, 0.02),
+               frameon=False, fontsize=10, title_fontsize=11)
+    fig.legend(handles=lvl_handles, title="Heterogeneity Level",
                loc="lower center", ncol=len(all_levels),
-               bbox_to_anchor=(0.5, 0.015), frameon=False,
-               fontsize=8, title_fontsize=9)
+               bbox_to_anchor=(0.85, 0.02), frameon=False,
+               fontsize=10, title_fontsize=11)
 
 #    fig.suptitle(title, fontsize=12, fontweight="semibold", y=1.01)
     fig.subplots_adjust(
     left=0.055,
     right=0.99,
     top=0.97,
-    bottom=0.20,   # reserve space for legends
+    bottom=0.16,   # reserve space for one row of side-by-side legends
     wspace=0.28,
     hspace=0.38,   # important: separates the two rows
 )

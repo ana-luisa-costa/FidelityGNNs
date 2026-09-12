@@ -1,15 +1,3 @@
-"""Benchmark 4: comparison of prediction targets.
-
-Computes the per-(dataset, explainer, target) fidelity score S_{E,q} = sqrt(a*b)
-(with bootstrap CIs) from each dataset's fidelity_curves_full/curve_checkpoint.csv
-and emits:
-
-  - target_profile_scores.csv   per-target and Overall S_E scores, all datasets
-  - target_profiles.{fmt}       faceted plot of S_{E,q} per target, per dataset
-
-target_profile_scores.csv is also the shared input consumed by
-benchmark_1_overall_score.py for its ranking/summary views.
-"""
 
 from __future__ import annotations
 

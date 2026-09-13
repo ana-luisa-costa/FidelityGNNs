@@ -28,7 +28,7 @@ pip install -r requirements.txt
 
 ### Data
 
-Download the data file from: https://figshare.com/s/cde2c35c6ab3f7ca5422, and add the folder to FidelityGNNs.
+Download the data file from: https://doi.org/10.7910/DVN/1ALBSU, and add the folder to FidelityGNNs.
 For reproducibility, we share all information about the datasets BPIC12_A, BPIC12_W, BPIC12_WC, BPIC13_I, BPIC13_O, BPIC17_O, BPIC20_P, and BPIC20_R, as well as embeddings, trained models, evaluation results, fidelity computations, and results obtained in different runs.
 
 ### Running the Full Pipeline

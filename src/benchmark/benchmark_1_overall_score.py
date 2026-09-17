@@ -210,14 +210,18 @@ def _plot_explainer_boxplot(
             linewidth=0.4,
             zorder=3,
         )
+    ymin, ymax = ax.get_ylim()
+    pad = (ymax - ymin) * 0.12
+    ax.set_ylim(ymin - pad, ymax)
+    for i, explainer in enumerate(order.index):
         ax.text(
             i,
-            ax.get_ylim()[0],
+            ymin - pad * 0.55,
             f"MR {mean_rank.get(explainer, np.nan):.1f}",
             ha="center",
             va="bottom",
-            fontsize=7,
-            color="0.25",
+            fontsize=10,
+            color="0.15",
         )
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([METHOD_LABELS.get(e, e) for e in order.index], rotation=20, ha="right")

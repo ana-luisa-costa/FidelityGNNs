@@ -17,7 +17,6 @@ from src.explainers._shared import (
     ExplainerContext,
     _enriched_label,
     _entity_short_label,
-    _k_hop_subgraph,
     _pair_side_caption,
     _plot_top_entities,
     _plot_top_entities_signed,
@@ -27,9 +26,11 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.gnn4ppm.train import get_event_attrs
+from gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
+
+PLOT_TOP_K = 20
 
 
 def _model_prediction_scalar(
@@ -97,6 +98,58 @@ def _gradient_saliency(
     return grad_x_input_signed, grad_x_input_abs, pred_meta
 
 
+def _save_pair_plots(
+    g,
+    id2ent: Dict[int, str],
+    plot_dir: str,
+    pair_idx: int,
+    task: str,
+    src_id: int,
+    dst_id: int,
+    top_local_ids: List[int],
+    top_global_ids: List[int],
+    gxi_abs: np.ndarray,
+    gxi_signed: np.ndarray,
+    noreorder_only: bool,
+) -> None:
+    local_ids = top_local_ids[:PLOT_TOP_K]
+    labels = [_enriched_label(g, id2ent, nid) for nid in top_global_ids[:PLOT_TOP_K]]
+    signed_scores = np.array([float(gxi_signed[i]) for i in local_ids])
+    side_text = _pair_side_caption(g, id2ent, src_id, dst_id, pair_idx)
+    base = os.path.join(plot_dir, f"pair{pair_idx:05d}_{task}")
+
+    if not noreorder_only:
+        abs_scores = np.array([float(gxi_abs[i]) for i in local_ids])
+        _plot_top_entities(
+            abs_scores,
+            labels,
+            f"Gradient saliency (|Input*Gradient|) — pair {pair_idx}, {task}",
+            f"{base}.png",
+            top_k=PLOT_TOP_K,
+            xlabel="|grad · x|  (input * gradient magnitude)",
+            pair_side_text=side_text,
+        )
+        _plot_top_entities_signed(
+            signed_scores,
+            labels,
+            f"Signed gradient saliency (Input*Gradient) — pair {pair_idx}, {task}",
+            f"{base}_signed.png",
+            top_k=PLOT_TOP_K,
+            xlabel="grad · x  (red = supports prediction, blue = opposes prediction)",
+            pair_side_text=side_text,
+        )
+
+    _plot_top_entities_signed_noreorder(
+        signed_scores,
+        labels,
+        f"Gradient saliency (signed Input*Gradient, ranked by |Input*Gradient|) - pair {pair_idx}, {task}",
+        f"{base}_signed_noreorder.png",
+        top_k=PLOT_TOP_K,
+        xlabel="grad · x  (no reorder, red = supports prediction, blue = opposes prediction)",
+        pair_side_text=side_text,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Input * Gradient saliency explainer for the R-GCN event-pair model."
@@ -106,6 +159,11 @@ def main() -> None:
     ap.add_argument("--k-hop", type=int, default=0)
     ap.add_argument("--gradient-exclude-dst", action="store_true")
     ap.add_argument("--save-plots", action="store_true")
+    ap.add_argument(
+        "--noreorder-only",
+        action="store_true",
+        help="With --save-plots, write only the signed_noreorder plot.",
+    )
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -113,7 +171,6 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_test, et_test = ctx.ei_test, ctx.et_test
     test_pairs = ctx.test_pairs
     y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
@@ -131,27 +188,14 @@ def main() -> None:
     for pi in tqdm(pair_indices, desc="pairs"):
         src_id, dst_id = test_pairs[pi]
 
-        if args.k_hop > 0:
-            nodes_t, ei_work, et_work, g2l = _k_hop_subgraph(
-                seeds=[src_id, dst_id],
-                edge_index=ei_test.detach().cpu(),
-                edge_type=et_test.detach().cpu(),
-                num_nodes=x.size(0),
-                k=args.k_hop,
-            )
-            x_work = x[nodes_t.to(device)]
-            ei_work = ei_work.to(device)
-            et_work = et_work.to(device)
-            src_work = g2l[src_id]
-            dst_work = g2l[dst_id]
-            local_to_global = [int(n) for n in nodes_t.tolist()]
-        else:
-            x_work = x
-            ei_work = ei_test
-            et_work = et_test
-            src_work = src_id
-            dst_work = dst_id
-            local_to_global = list(range(x.size(0)))
+        # prefix graph of the pair (k_hop<=0 keeps the whole prefix); dst is not in it
+        nodes_t, ei_work, et_work, g2l = ctx.pair_subgraph(pi, hops=max(0, int(args.k_hop)))
+        x_work = x[nodes_t.to(device)]
+        ei_work = ei_work.to(device)
+        et_work = et_work.to(device)
+        src_work = g2l[src_id]
+        dst_work = g2l.get(dst_id, -1)
+        local_to_global = [int(n) for n in nodes_t.tolist()]
 
         for task in tasks:
             try:
@@ -176,7 +220,7 @@ def main() -> None:
 
             all_local_ids = range(x_work.size(0))
             exclude = {src_work}
-            if args.gradient_exclude_dst:
+            if args.gradient_exclude_dst and dst_work >= 0:
                 exclude.add(dst_work)
             candidate_ids = [int(i) for i in all_local_ids if int(i) not in exclude]
             sorted_idx = np.argsort(-gxi_abs[candidate_ids])
@@ -204,42 +248,10 @@ def main() -> None:
             pd.DataFrame(rows).to_csv(os.path.join(pair_dir, csv_name), index=False)
 
             if args.save_plots:
-                plot_labels = [
-                    _enriched_label(g, id2ent, nid) for nid in top_global_ids[:20]
-                ]
-                plot_scores = np.array(
-                    [float(gxi_abs[nid]) for nid in top_local_ids[:20]]
-                )
-                side_txt = _pair_side_caption(g, id2ent, src_id, dst_id, pi)
-                _plot_top_entities(
-                    plot_scores,
-                    plot_labels,
-                    f"Gradient saliency (|Input*Gradient|) — pair {pi}, {task}",
-                    os.path.join(gradient_dir, f"pair{pi:05d}_{task}.png"),
-                    top_k=20,
-                    xlabel="|grad · x|  (input * gradient magnitude)",
-                    pair_side_text=side_txt,
-                )
-                signed_scores = np.array(
-                    [float(gxi_signed[nid]) for nid in top_local_ids[:20]]
-                )
-                _plot_top_entities_signed(
-                    signed_scores,
-                    plot_labels,
-                    f"Signed gradient saliency (Input*Gradient) — pair {pi}, {task}",
-                    os.path.join(gradient_dir, f"pair{pi:05d}_{task}_signed.png"),
-                    top_k=20,
-                    xlabel="grad · x  (red = supports prediction, blue = opposes prediction)",
-                    pair_side_text=side_txt,
-                )
-                _plot_top_entities_signed_noreorder(
-                    np.array([float(gxi_signed[nid]) for nid in top_local_ids[:20]]),
-                    plot_labels,
-                    f"Gradient saliency (signed Input*Gradient, ranked by |Input*Gradient|) - pair {pi}, {task}",
-                    os.path.join(gradient_dir, f"pair{pi:05d}_{task}_signed_noreorder.png"),
-                    top_k=20,
-                    xlabel="grad · x  (no reorder, red = supports prediction, blue = opposes prediction)",
-                    pair_side_text=side_txt,
+                _save_pair_plots(
+                    g, id2ent, gradient_dir, pi, task, src_id, dst_id,
+                    top_local_ids, top_global_ids, gxi_abs, gxi_signed,
+                    args.noreorder_only,
                 )
 
             summary_row = {
@@ -263,6 +275,7 @@ def main() -> None:
             "k_hop": args.k_hop,
             "gradient_exclude_dst": args.gradient_exclude_dst,
             "save_plots": args.save_plots,
+            "noreorder_only": args.noreorder_only,
         },
         rows=summary_rows,
     )

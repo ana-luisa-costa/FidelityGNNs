@@ -2,7 +2,7 @@
   "ttl": "data/raw/BPIC20_R/BPIC20_Request.ttl",
   "emb": "data/raw/BPIC20_R/entity_embeddings.npy",
   "entity2id": "data/raw/BPIC20_R/entity2id.json",
-  "case_split": "data/raw/BPIC20_R/case_split.json",
+  "temporal_split": "data/raw/BPIC20_R/temporal_split.json",
   "model": "data/processed/BPIC20_R/best_val_model.pt",
   "vocabs": "data/processed/BPIC20_R/best_val_vocabs.json",
   "best_test": "data/processed/BPIC20_R/best_val.pt",

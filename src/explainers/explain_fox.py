@@ -31,7 +31,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.gnn4ppm.train import get_event_attrs
+from gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
 
@@ -314,13 +314,15 @@ def main() -> None:
                     help="Top firing rules saved per pair (default 5)")
     ap.add_argument("--fox-exclude-dst", action="store_true", dest="fox_exclude_dst",
                     help="Exclude destination event node from candidate entities")
+    ap.add_argument("--fox-subgraph-hop", type=int, default=0, dest="fox_subgraph_hop",
+                    help="k-hop neighbourhood of src inside the pair's prefix graph "
+                         "(<=0 keeps the whole prefix)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_test, et_test = ctx.ei_test, ctx.et_test
     test_pairs = ctx.test_pairs
     y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
@@ -339,29 +341,37 @@ def main() -> None:
 
     for pi in tqdm(pair_indices, desc="pairs"):
         src_id, dst_id = test_pairs[pi]
-        exclude = {src_id}
-        if args.fox_exclude_dst:
-            exclude.add(dst_id)
+        # prefix graph of the pair, local node ids; dst is never part of it
+        nodes_t, ei_sub, et_sub, g2l = ctx.pair_subgraph(
+            pi, hops=max(0, int(args.fox_subgraph_hop))
+        )
+        x_sub = x[nodes_t.to(device)].detach()
+        ei_sub, et_sub = ei_sub.to(device), et_sub.to(device)
+        l2g = [int(n) for n in nodes_t.tolist()]
+        src_local = g2l[src_id]
+        exclude = {src_local}
+        if args.fox_exclude_dst and dst_id in g2l:
+            exclude.add(g2l[dst_id])
 
         for task in tasks:
             try:
-                feat_ids = _gradient_top_ids(
-                    encoder, head, x, ei_test, et_test,
-                    src_id, task, y_act_test, y_time_test, pi, device,
+                feat_ids_local = _gradient_top_ids(
+                    encoder, head, x_sub, ei_sub, et_sub,
+                    src_local, task, y_act_test, y_time_test, pi, device,
                     args.fox_m, exclude,
                 )
             except Exception as exc:
                 print(f"[warn] gradient selection failed pair={pi} task={task}: {exc}")
                 continue
 
-            if len(feat_ids) < 2:
-                print(f"[warn] fox skip pair={pi} task={task}: only {len(feat_ids)} candidate(s)")
+            if len(feat_ids_local) < 2:
+                print(f"[warn] fox skip pair={pi} task={task}: only {len(feat_ids_local)} candidate(s)")
                 continue
 
             try:
                 anfis_model, importance = _fox_explain(
-                    encoder, head, x, ei_test, et_test,
-                    src_id, feat_ids, task,
+                    encoder, head, x_sub, ei_sub, et_sub,
+                    src_local, feat_ids_local, task,
                     y_act_test, y_time_test, pi, device,
                     n_perturb=args.fox_perturb,
                     num_mfs=args.fox_num_mfs,
@@ -373,6 +383,8 @@ def main() -> None:
                 print(f"[warn] FOX ANFIS failed pair={pi} task={task}: {exc}")
                 continue
 
+            # report in global entity ids
+            feat_ids = [l2g[i] for i in feat_ids_local]
             rules = _extract_rules(anfis_model, feat_ids, id2ent, g, top_k=args.fox_top_rules)
 
             act_name, _, _, _ = get_event_attrs(g, id2ent.get(dst_id, ""))

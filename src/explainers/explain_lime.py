@@ -22,7 +22,6 @@ from src.explainers._shared import (
     ExplainerContext,
     _enriched_label,
     _entity_short_label,
-    _k_hop_subgraph,
     _pair_side_caption,
     _scalar_for_model_task,
     _scalar_for_task,
@@ -31,7 +30,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.gnn4ppm.train import RGCNEncoder, _sanitize, get_event_attrs
+from gnn4ppm.train import RGCNEncoder, _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -281,7 +280,6 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head = ctx.encoder, ctx.head
     x, g, id2ent = ctx.x, ctx.g, ctx.id2ent
-    ei_test, et_test = ctx.ei_test, ctx.et_test
     test_pairs = ctx.test_pairs
     y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
@@ -308,18 +306,13 @@ def main() -> None:
         src_id, dst_id = test_pairs[pi]
         pair_test_idx = pi
 
-        nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph( #DEMO1 extract the k-hop subgraph around the source and destination entities of the pair
-            seeds=[src_id, dst_id],
-            edge_index=ei_test,
-            edge_type=et_test,
-            num_nodes=x.size(0),
-            k=max(0, int(args.k_hop)),
-        )
+        # prefix graph of the pair, cut to the k-hop neighbourhood of src; dst is not in it
+        nodes_t, ei_sub, et_sub, g2l = ctx.pair_subgraph(pi, hops=max(0, int(args.k_hop)))
         x_sub = x[nodes_t.to(device)]
         ei_sub = ei_sub.to(device)
         et_sub = et_sub.to(device)
         src_local = g2l[src_id]
-        dst_local = g2l[dst_id]
+        dst_local = g2l.get(dst_id, -1)
         l2g: Dict[int, int] = {ln: gn for gn, ln in g2l.items()}
         # DEMO2 exclude src and dst from candidates 
         feat_ids = _structural_graphlime_candidates(

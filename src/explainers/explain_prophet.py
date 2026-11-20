@@ -17,7 +17,6 @@ from tqdm import tqdm
 from src.explainers._shared import (
     ExplainerContext,
     _entity_short_label,
-    _k_hop_subgraph,
     add_common_explainer_args,
     load_explainer_context,
     setup_matplotlib_style,
@@ -31,7 +30,7 @@ from src.explainers.prophet_core import (
     validate_classification_task,
 )
 from src.fidelity.fidelity_utils import task_target_value_nodes
-from src.gnn4ppm.train import _sanitize, get_event_attrs
+from gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -195,7 +194,6 @@ def main() -> None:
     context: ExplainerContext = load_explainer_context(args, device)
     encoder, head = context.encoder, context.head
     x, graph, id2ent = context.x, context.g, context.id2ent
-    ei_test, et_test = context.ei_test, context.et_test
     test_pairs = context.test_pairs
     num_rel, rel2id = context.num_rel, context.rel2id
     id2rel = {value: key for key, value in rel2id.items()}
@@ -210,20 +208,12 @@ def main() -> None:
     summary_rows: List[dict] = []
     for pair_idx in tqdm(pair_indices, desc="PROPHET pairs"):
         src_global, dst_global = test_pairs[pair_idx]
-        if args.prophet_subgraph_hop > 0:
-            nodes, ei_sub, et_sub, g2l = _k_hop_subgraph(
-                seeds=[src_global, dst_global],
-                edge_index=ei_test,
-                edge_type=et_test,
-                num_nodes=x.size(0),
-                k=args.prophet_subgraph_hop,
-            )
-            x_sub = x[nodes.to(device)].detach()
-            ei_sub, et_sub = ei_sub.to(device), et_sub.to(device)
-        else:
-            nodes = torch.arange(x.size(0))
-            x_sub, ei_sub, et_sub = x.detach(), ei_test, et_test
-            g2l = {index: index for index in range(x.size(0))}
+        # prefix graph of the pair (hop<=0 keeps the whole prefix); dst is not in it
+        nodes, ei_sub, et_sub, g2l = context.pair_subgraph(
+            pair_idx, hops=max(0, int(args.prophet_subgraph_hop))
+        )
+        x_sub = x[nodes.to(device)].detach()
+        ei_sub, et_sub = ei_sub.to(device), et_sub.to(device)
 
         src_local = g2l[src_global]
         dst_local = g2l.get(dst_global, -1)

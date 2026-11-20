@@ -1,37 +1,35 @@
-import re
 import json
+import math
 import os
 import argparse
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import optuna
-from datetime import datetime, timezone
 from rdflib import Graph, URIRef
 from torch_geometric.nn import RGCNConv
 
-from src.utils.uri_helpers import get_case_of_entity, EVENT_RE, CASE_RE
-from src.utils.io_helpers import load_entity2id, load_embeddings, load_case_split
+from src.utils.uri_helpers import CASE_URI, EVENT_RE, P_TIME, parse_ts, order_case_events, usable_event_uris, event_timestamps
+from src.utils.io_helpers import load_entity2id, load_embeddings, load_temporal_boundaries
 
 
 P_ACT  = "http://example.org/hasevent_activity_concept_name"
-P_TIME = "http://example.org/hasevent_timestamp_time_timestamp"
+P_FOLLOWS = "http://example.org/eventDirectlyFollows"  
+UNK = "<UNK>"  # class of a missing or train-unseen categorical value
 
+# The only case attributes used as features: both are recorded when the case
+# starts, so every prefix may see them. The BPIC20 ones change during a case
+# and for the BPIC13 ones it is unknown when they are recorded.
+P_AMOUNT_REQ = "http://example.org/hascase_otherN_case_AMOUNT_REQ"
+P_REG_DATE   = "http://example.org/hascase_otherN_case_REG_DATE"
 
-def parse_ts(ts: str) -> Optional[float]:
-    ts = str(ts).strip()
-    if len(ts) < 14 or not ts[:14].isdigit():
-        return None
-    try:
-        dt = datetime.strptime(ts[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        frac = ts[14:]
-        frac_sec = (int(frac) / (10 ** len(frac))) if (frac and frac.isdigit()) else 0.0
-        return dt.timestamp() + frac_sec
-    except Exception:
-        return None
+NAN = float("nan")
+TIME_COLUMNS = slice(0, 4)  # filled for event nodes
+CASE_COLUMNS = slice(4, 6)  # filled for case nodes
+N_NODE_FEATURES = 6
 
 
 def get_event_attrs(g, event_uri: str):
@@ -51,123 +49,199 @@ def get_event_attrs(g, event_uri: str):
     return act, ts, otherC, otherN
 
 
-def build_graph(g, ent2id: Dict[str, int], rel2id: Dict[str, int],
-                excluded_cases: Optional[set] = None,
-                allow_new_relations: bool = True):
-    src_list, dst_list, rel_list = [], [], []
+def build_case_map(id2ent: Dict[int, str], usable: set,
+                   event_ts: Dict[str, Optional[float]]) -> Dict[str, List[int]]:
+    """case_id → usable event node ids in temporal order (event# breaks ties)."""
+    events_by_case: Dict[str, Dict[int, Tuple[int, Optional[float]]]] = {}
+    for nid, uri in id2ent.items():
+        m = EVENT_RE.search(uri)
+        if m and uri in usable:
+            ev_num, cid = int(m.group(1)), m.group(2)
+            events_by_case.setdefault(cid, {})[ev_num] = (nid, event_ts.get(uri))
+    return {cid: order_case_events(evs) for cid, evs in events_by_case.items()}
+
+
+def split_pairs_by_time(case_map: Dict[str, List[int]], id2ent: Dict[int, str],
+                        event_ts: Dict[str, Optional[float]], t1: float, t2: float):
+    """Consecutive (src, dst) event pairs, assigned to train/val/test by dst time."""
+    train_pairs: List[Tuple[int, int]] = []
+    val_pairs:   List[Tuple[int, int]] = []
+    test_pairs:  List[Tuple[int, int]] = []
+    for cid, events in case_map.items():
+        for src_id, dst_id in zip(events, events[1:]):
+            ts = event_ts[id2ent[dst_id]]  # each pair is assigned by its target's time
+            if ts < t1:
+                train_pairs.append((src_id, dst_id))
+            elif ts < t2:
+                val_pairs.append((src_id, dst_id))
+            else:
+                test_pairs.append((src_id, dst_id))
+    return train_pairs, val_pairs, test_pairs
+
+
+def add_inverse_edges(ei: torch.Tensor, et: torch.Tensor, num_rel: int):
+    s, o = ei
+    return (torch.cat([ei, torch.stack([o, s])], dim=1),
+            torch.cat([et, et + num_rel]))
+
+
+def collect_case_triples(g, ent2id: Dict[str, int], rel2id: Dict[str, int],
+                         case_map: Dict[str, List[int]]):
+    """Group triples by case, keeping only those that touch an event node.
+
+    Value-to-value triples (e.g. directlyFollows between shared attribute nodes)
+    are dropped: they would connect events across cases and across time.
+    """
+    case_of_node = {nid: cid for cid, events in case_map.items() for nid in events}
+
+    triples_by_case: Dict[str, List[Tuple[int, int, int]]] = {}
     for s, p, o in g:
         ps = str(p)
         if "rdf-schema" in ps or ps.endswith("#type"):
             continue
-        if "directlyFollows" in ps:
+        if ps == P_TIME:  # time is a feature of the event node, not a node
             continue
         s_str, o_str = str(s), str(o)
         if s_str not in ent2id or o_str not in ent2id:
             continue
-        if excluded_cases is not None:
-            s_case = get_case_of_entity(s_str)
-            o_case = get_case_of_entity(o_str)
-            if ((s_case is not None and s_case in excluded_cases) or
-                (o_case is not None and o_case in excluded_cases)):
-                continue
-        s_is_event = EVENT_RE.search(s_str) is not None
-        o_is_event = EVENT_RE.search(o_str) is not None
-        s_is_case = CASE_RE.search(s_str) is not None
-        o_is_case = CASE_RE.search(o_str) is not None
-        if s_is_event and o_is_case:
-            continue  # event->case would let future events update the case node
-        if o_is_event and not s_is_event:
-            src, dst = s_str, o_str   # case->event: keep direction
-        elif s_is_event or s_is_case:
-            src, dst = o_str, s_str   # reverse to attribute->event / attribute->case
-        else:
-            src, dst = s_str, o_str
-        if ps not in rel2id and not allow_new_relations:
-            raise KeyError(f"Relation {ps!r} is missing from checkpoint rel2id")
+        s_id, o_id = ent2id[s_str], ent2id[o_str]
+        cid = case_of_node.get(s_id)
+        if cid is None:
+            cid = case_of_node.get(o_id)
+        if cid is None:
+            continue
         if ps not in rel2id:
             rel2id[ps] = len(rel2id)
-        src_list.append(ent2id[src])
-        dst_list.append(ent2id[dst])
-        rel_list.append(rel2id[ps])
-
-    ei = torch.tensor([src_list, dst_list], dtype=torch.long)
-    et = torch.tensor(rel_list, dtype=torch.long)
-    return ei, et
+        triples_by_case.setdefault(cid, []).append((s_id, o_id, rel2id[ps]))
+    return triples_by_case
 
 
-DF_REL = "http://example.org/directlyFollows"
+def build_prefix_batch(pairs: List[Tuple[int, int]],
+                       case_map: Dict[str, List[int]],
+                       triples_by_case: Dict[str, List[Tuple[int, int, int]]],
+                       follows_rel: int,
+                       device):
+    """Disjoint union of one prefix subgraph per (src, dst) pair.
 
+    Each subgraph holds only the case's events up to and including src plus
+    their attribute nodes; shared value nodes are duplicated per subgraph, so no
+    path reaches a future event or another prefix. Consecutive prefix events are
+    chained with follows_rel so the encoder can learn the event order.
 
-def build_train_directly_follows(g, ent2id: Dict[str, int], rel2id: Dict[str, int],
-                                 train_cases: set,
-                                 allow_new_relations: bool = True):
-    case_map: Dict[str, Dict[int, str]] = {}
-    for uri in ent2id:
-        m = EVENT_RE.search(uri)
-        if m and m.group(2) in train_cases:
-            case_map.setdefault(m.group(2), {})[int(m.group(1))] = uri
-
-    pairs = set()
-    for km in case_map.values():
-        ks = sorted(km.keys())
-        for a, b in zip(ks, ks[1:]):
-            if b != a + 1:
-                continue
-            act_a, _, oc_a, _ = get_event_attrs(g, km[a])
-            act_b, _, oc_b, _ = get_event_attrs(g, km[b])
-            if act_a and act_b:
-                pairs.add((act_b, act_a))
-            for k, v_b in oc_b.items():
-                v_a = oc_a.get(k)
-                if v_a:
-                    pairs.add((v_b, v_a))
-
-    pairs = sorted((s, o) for s, o in pairs if s in ent2id and o in ent2id)
-    if pairs and DF_REL not in rel2id:
-        if not allow_new_relations:
-            raise KeyError(f"Relation {DF_REL!r} is missing from checkpoint rel2id")
-        rel2id[DF_REL] = len(rel2id)
-    rel = rel2id.get(DF_REL, 0)
-    src = [ent2id[s] for s, _ in pairs]
-    dst = [ent2id[o] for _, o in pairs]
-    ei = torch.tensor([src, dst], dtype=torch.long)
-    et = torch.full((len(pairs),), rel, dtype=torch.long)
-    return ei, et
-
-
-def _split_fit_val_cases(
-    g, case_map: Dict[str, Dict[int, int]], id2ent: Dict[int, str],
-    train_cases: set, val_ratio: float = 0.1,
-) -> Tuple[set, set]:
-    """Chronological holdout carved out of train_cases only, used solely to
-    score Optuna trials (never to backprop, never to touch test_cases).
-
-    Mirrors the outer train/test split's own methodology (sort by earliest
-    event time, hold out the latest slice) instead of a random draw, so no
-    extra randomness/seed is introduced.
+    Returns (edge_index, edge_type, node_orig, src_pos), where node_orig maps
+    each batched node to its original entity id and src_pos gives the batched
+    node of each pair's src event (aligned with pairs).
     """
-    earliest: Dict[str, float] = {}
-    for cid, km in case_map.items():
-        if cid not in train_cases:
-            continue
-        best = None
-        for nid in km.values():
-            _, t_str, _, _ = get_event_attrs(g, id2ent[nid])
-            ts = parse_ts(t_str)
-            if ts is not None and (best is None or ts < best):
-                best = ts
-        # Cases with no parseable timestamp sort first (into fit), not last,
-        # so they can't quietly dominate the small held-out val slice.
-        earliest[cid] = best if best is not None else float("-inf")
+    event_rank: Dict[int, Tuple[str, int]] = {}  # event node → (case, position)
+    for cid, events in case_map.items():
+        for rank, nid in enumerate(events):
+            event_rank[nid] = (cid, rank)
 
-    ordered = sorted(train_cases, key=lambda c: earliest.get(c, float("-inf")))
-    n_total = len(ordered)
-    n_val = int(round(n_total * val_ratio))
-    n_val = max(0, min(n_val, n_total - 1)) if n_total > 1 else 0
+    src_l, dst_l, rel_l = [], [], []
+    node_orig: List[int] = []
+    src_pos:   List[int] = []
 
-    val_cases = set(ordered[n_total - n_val:]) if n_val else set()
-    fit_cases = set(ordered) - val_cases
-    return fit_cases, val_cases
+    for src_id, _ in pairs:
+        cid, src_rank = event_rank[src_id]
+        local: Dict[int, int] = {}
+
+        def local_id(n: int) -> int:
+            if n not in local:
+                local[n] = len(node_orig)
+                node_orig.append(n)
+            return local[n]
+
+        src_pos.append(local_id(src_id))
+        for s, o, r in triples_by_case.get(cid, []):
+            if any(n in event_rank and event_rank[n][1] > src_rank for n in (s, o)):
+                continue
+            src_l.append(local_id(s))
+            dst_l.append(local_id(o))
+            rel_l.append(r)
+
+        prefix_events = case_map[cid][:src_rank + 1]
+        for prev, nxt in zip(prefix_events, prefix_events[1:]):
+            src_l.append(local_id(prev))
+            dst_l.append(local_id(nxt))
+            rel_l.append(follows_rel)
+
+    ei = torch.tensor([src_l, dst_l], dtype=torch.long)
+    et = torch.tensor(rel_l, dtype=torch.long)
+    return (ei, et,
+            torch.tensor(node_orig, dtype=torch.long),
+            torch.tensor(src_pos, dtype=torch.long, device=device))
+
+
+# node features
+
+def log_seconds(later: Optional[float], earlier: Optional[float]) -> float:
+    """log1p of the seconds from `earlier` to `later`; NaN if either is unknown."""
+    if later is None or earlier is None:
+        return NAN
+    if later < earlier:
+        raise ValueError("A feature may only look back in time.")
+    return math.log1p(later - earlier)
+
+
+def event_time_features(ts: Optional[float], previous_ts: Optional[float],
+                        case_start: Optional[float]) -> List[float]:
+    """[log seconds since the previous event, log seconds since the first event,
+    hour of day, weekday] of an event."""
+    if ts is None:
+        return [NAN] * 4
+    moment = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return [log_seconds(ts, previous_ts), log_seconds(ts, case_start),
+            moment.hour, moment.weekday()]
+
+
+def case_start_features(g, case_uri: str, case_start: Optional[float]) -> List[float]:
+    """[log requested amount, log seconds from registration to the first event]."""
+    case = URIRef(case_uri)
+    # any=False raises on several values: such an attribute changes during the
+    # case, so an early prefix would see a value that is only recorded later
+    amount = g.value(case, URIRef(P_AMOUNT_REQ), any=False)
+    registered = g.value(case, URIRef(P_REG_DATE), any=False)
+    return [NAN if amount is None else math.log1p(float(amount)),
+            log_seconds(case_start, parse_ts(registered))]
+
+
+def build_node_features(g, ent2id: Dict[str, int], case_map: Dict[str, List[int]],
+                        event_ts: Dict[str, Optional[float]]) -> torch.Tensor:
+    """Numeric features per node, NaN where a feature does not apply.
+
+    A row only uses what is known when its node first enters a prefix graph
+    (the event itself, its predecessors and the case start), so every prefix
+    graph containing the node shares the row.
+    """
+    node_ts = {ent2id[uri]: ts for uri, ts in event_ts.items()}
+    features = [[NAN] * N_NODE_FEATURES for _ in ent2id]
+    for cid, events in case_map.items():
+        timestamps = [node_ts.get(event) for event in events]
+        previous = timestamps[:1] + timestamps  # the first event has no gap
+        for event, ts, previous_ts in zip(events, timestamps, previous):
+            features[event][TIME_COLUMNS] = event_time_features(ts, previous_ts, timestamps[0])
+        case_uri = CASE_URI.format(cid)
+        features[ent2id[case_uri]][CASE_COLUMNS] = case_start_features(g, case_uri, timestamps[0])
+    return torch.tensor(features)
+
+
+def feature_stats(features: torch.Tensor, fit_nodes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-column mean/std over `fit_nodes`, ignoring NaN."""
+    fit = features[fit_nodes]
+    mean = fit.nanmean(dim=0)
+    std = (fit - mean).pow(2).nanmean(dim=0).sqrt().clamp(min=1e-6)
+    return mean, std
+
+
+def apply_standardize(features: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Scale each column with the given mean/std; NaN becomes 0."""
+    return torch.nan_to_num((features - mean) / std)
+
+
+def standardize(features: torch.Tensor, fit_nodes: torch.Tensor) -> torch.Tensor:
+    """Scale each column with its mean/std over `fit_nodes`; NaN becomes 0."""
+    mean, std = feature_stats(features, fit_nodes)
+    return apply_standardize(features, mean, std)
 
 
 # model
@@ -265,66 +339,73 @@ def compute_loss(out, y_act, y_time, y_c, y_n, idx, time_weight, act_weight=None
     return loss
 
 
-# optuna
+def minmaxnorm(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    return (x - lo) / (hi - lo).clamp_min(1e-8)
 
+
+# optuna
+time_w = 0.2
 def objective(trial, data, args):
     hid_dim    = trial.suggest_categorical("hid_dim", [64, 128, 256])
     lr         = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     num_bases  = trial.suggest_int("num_bases", 10, 50)
     dropout    = trial.suggest_float("dropout", 0.2, 0.5)
-    time_weight = trial.suggest_float("time_weight", 0.1, 1.0)
     head_hidden = trial.suggest_categorical("head_hidden", [64, 128, 256])
     otherC_weight_factor = trial.suggest_float("otherC_weight", 0.3, 1.0)
-    otherN_weight_factor = trial.suggest_float("otherN_weight", 0.1, 0.5) 
+    otherN_weight_factor = trial.suggest_float("otherN_weight", 0.1, 0.5)
 
-    (x, ei_tr, et_tr, num_rel,
-     train_pairs_t,
+    (x_tr, ei_tr, et_tr, src_tr,
+     x_val, ei_val, et_val, src_val,
+     num_rel, train_idx, val_idx,
      y_act, y_time, y_c, y_n,
-     n_train, device, act_weight, otherC_weights,
-     fit_idx, val_idx) = data
+     device, act_weight, otherC_weights) = data
 
-    encoder = RGCNEncoder(x.size(1), hid_dim, hid_dim, num_rel,
+    encoder = RGCNEncoder(x_tr.size(1), hid_dim, hid_dim, num_rel * 2,
                           num_bases=num_bases, dropout=dropout).to(device)
-    head = _make_head(hid_dim, y_act[:n_train],
-                      {k: v[:n_train] for k, v in y_c.items()},
-                      y_n, device, head_hidden=head_hidden)
+    head = _make_head(hid_dim, y_act, y_c, y_n, device, head_hidden=head_hidden)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(head.parameters()), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.optuna_epochs)
 
-    # Backprop only on fit_idx; score trials on val_idx (both carved out of
-    # train_cases only — see _split_fit_val_cases). Each is its own head()
-    # call restricted to that pair subset's rows, so compute_loss (which
-    # expects out's rows already aligned to idx) needs no changes.
-    use_val = val_idx.numel() > 0
-    best_score = float("inf")
+    best_v = float("inf")
+
+    # Time range from training targets only, to avoid leaking validation info
+    y_time_tr = y_time[train_idx]
+    y_time_tr = y_time_tr[torch.isfinite(y_time_tr)]
+    t_lo, t_hi = y_time_tr.min(), y_time_tr.max()
 
     for epoch in range(args.optuna_epochs):
         encoder.train(); head.train()
         optimizer.zero_grad()
-        z = encoder(x, ei_tr, et_tr)
-        out_fit = head(z[train_pairs_t[fit_idx, 0]])
-        fit_loss = compute_loss(out_fit, y_act, y_time, y_c, y_n, fit_idx, time_weight, act_weight, otherC_weights, otherC_weight_factor, otherN_weight_factor)
-        fit_loss.backward()
+        z   = encoder(x_tr, ei_tr, et_tr)
+        out = head(z[src_tr])
+        loss = compute_loss(out, y_act, y_time, y_c, y_n, train_idx, time_w, act_weight, otherC_weights, otherC_weight_factor, otherN_weight_factor)
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(head.parameters()), max_norm=1.0)
         optimizer.step()
+
+        encoder.eval(); head.eval()
+        with torch.no_grad():
+            z_v  = encoder(x_val, ei_val, et_val)
+            v_out = head(z_v[src_val])
+            m_act = y_act[val_idx] >= 0
+            if m_act.any():
+                v_loss = F.cross_entropy(v_out["act"][m_act], y_act[val_idx][m_act], weight=act_weight)
+            else:
+                v_loss = torch.tensor(float("inf"))
+            m_t = torch.isfinite(y_time[val_idx])
+            if m_t.any():
+                v_loss = v_loss + 0.2 * F.mse_loss(
+                    minmaxnorm(v_out["time"][m_t], t_lo, t_hi),
+                    minmaxnorm(y_time[val_idx][m_t], t_lo, t_hi))
+
         scheduler.step()
-
-        if use_val:
-            encoder.eval(); head.eval()
-            with torch.no_grad():
-                z_eval = encoder(x, ei_tr, et_tr)
-                out_val = head(z_eval[train_pairs_t[val_idx, 0]])
-                score = compute_loss(out_val, y_act, y_time, y_c, y_n, val_idx, time_weight, act_weight, otherC_weights, otherC_weight_factor, otherN_weight_factor).item()
-        else:
-            score = fit_loss.item()
-
-        trial.report(score, epoch)
+        trial.report(v_loss.item(), epoch)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
-        best_score = min(best_score, score)
+        best_v = min(best_v, v_loss.item())
 
-    return best_score
+    return best_v
 
 
 def _make_head(hid_dim, y_act, y_c, y_n, device, head_hidden=256):
@@ -341,24 +422,19 @@ def main():
     ap.add_argument("--ttl",          required=True)
     ap.add_argument("--emb",          required=True, help="entity_embeddings.npy")
     ap.add_argument("--entity2id",    required=True, help="entity2id.json")
-    ap.add_argument("--case_split",   required=True, help="case_split.json from build_rdf2vec_2.py")
-    ap.add_argument("--save_best_test", "--save_best_val", dest="save_best_test", required=True)
-    ap.add_argument(               ### added argument for saving model ###
-        "--save_model",
-        default=None,
-        help="Path to save encoder+head checkpoint (default: same base as --save_best_test with _model.pt).",
-    ) 
+    ap.add_argument("--temporal_split", required=True, help="temporal_split.json from build_rdf2vec.py")
+    ap.add_argument("--save_best_val",required=True)
+    ap.add_argument("--save_model",   default=None,
+                    help="Path to save the encoder/head checkpoint used by the explainers "
+                         "(default: <save_best_val stem>_model.pt).")
     ap.add_argument("--vocabs_out",   default=None,  help="Path to save vocabs.json (for evaluate).")
-    ap.add_argument("--epochs",        type=int, default=30)
-    ap.add_argument("--optuna_epochs", type=int, default=10,
+    ap.add_argument("--epochs",        type=int, default=200,
+                    help="Max epochs for final training. Early stopping may end sooner.")
+    ap.add_argument("--optuna_epochs", type=int, default=50,
                     help="Epochs per Optuna trial (shorter than final training).")
     ap.add_argument("--trials",        type=int, default=30)
-    ap.add_argument(
-        "--optuna_val_ratio", type=float, default=0.1,
-        help="Fraction of train_cases (chronologically most recent) held out "
-             "from Optuna's fit loss and used only to score trials. Never "
-             "touches test_cases.",
-    )
+    ap.add_argument("--patience",      type=int, default=50,
+                    help="Stop final training if val loss does not improve for this many epochs.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -366,78 +442,79 @@ def main():
     ent2id = load_entity2id(args.entity2id)
     id2ent = {i: e for e, i in ent2id.items()}
     x      = load_embeddings(args.emb).to(device)
-    x_cpu  = x.cpu()
 
-    train_cases, test_cases = load_case_split(args.case_split)
-    print(f"Case split loaded: {len(train_cases)} train / {len(test_cases)} test")
+    t1, t2 = load_temporal_boundaries(args.temporal_split)
+    print(f"Temporal boundaries: t1={t1}  t2={t2}")
 
     print("Parsing TTL …")
     g = Graph()
     g.parse(args.ttl, format="turtle")
 
-    rel2id: Dict[str, int] = {}
-    ei_tr, et_tr = build_graph(g, ent2id, rel2id, excluded_cases=test_cases)
+    usable = usable_event_uris(g)
 
-    ei_df, et_df = build_train_directly_follows(g, ent2id, rel2id, train_cases)
-    ei_tr = torch.cat([ei_tr, ei_df], dim=1)
-    et_tr = torch.cat([et_tr, et_df])
-    num_rel = len(rel2id)
-
-
-    rel2id_test = dict(rel2id)
-    ei_test, et_test = build_graph(g, ent2id, rel2id_test, excluded_cases=train_cases)
-    keep = et_test < num_rel  
-    ei_test, et_test = ei_test[:, keep], et_test[keep]
-
-    ei_test = torch.cat([ei_test, ei_df], dim=1)
-    et_test = torch.cat([et_test, et_df])
-
-    ei_tr,  et_tr  = ei_tr.to(device),  et_tr.to(device)
-    ei_test, et_test = ei_test.to(device), et_test.to(device)
-    print(f"Train graph: {et_tr.size(0)} edges  |  Test graph: {et_test.size(0)} edges  "
-          f"(incl. {et_df.size(0)} train-only directlyFollows)")
-
-    case_map: Dict[str, Dict[int, int]] = {}   # case_id → {event_num → node_id}
+    # event order inside a case comes from timestamps; event# only breaks ties
+    event_ts = event_timestamps(g)
+    events_by_case: Dict[str, Dict[int, Tuple[int, Optional[float]]]] = {}
     for nid, uri in id2ent.items():
         m = EVENT_RE.search(uri)
-        if m:
+        if m and uri in usable:
             ev_num, cid = int(m.group(1)), m.group(2)
-            case_map.setdefault(cid, {})[ev_num] = nid
-
-    fit_cases, val_cases = _split_fit_val_cases(
-        g, case_map, id2ent, train_cases, val_ratio=args.optuna_val_ratio)
-    print(f"Optuna case split (out of train_cases only): "
-          f"{len(fit_cases)} fit / {len(val_cases)} val")
+            events_by_case.setdefault(cid, {})[ev_num] = (nid, event_ts.get(uri))
+    case_map: Dict[str, List[int]] = {   # case_id → event node ids in temporal order
+        cid: order_case_events(evs) for cid, evs in events_by_case.items()}
 
     train_pairs: List[Tuple[int,int]] = []
-    train_pair_cases: List[str] = []   # cid for each train_pairs entry, parallel list
-    test_pairs:   List[Tuple[int,int]] = []
+    val_pairs:   List[Tuple[int,int]] = []
+    test_pairs:  List[Tuple[int,int]] = []
 
-    for cid, km in case_map.items():
-        ks = sorted(km.keys())
-        case_pairs = [(km[ks[i]], km[ks[i+1]])
-                      for i in range(len(ks)-1)
-                      if ks[i]+1 in km]
-        if cid in train_cases:
-            train_pairs.extend(case_pairs)
-            train_pair_cases.extend([cid] * len(case_pairs))
-        else:
-            test_pairs.extend(case_pairs)
+    for cid, events in case_map.items():
+        for src_id, dst_id in zip(events, events[1:]):
+            ts = event_ts[id2ent[dst_id]]  # each pair is assigned by its target's time
+            if ts < t1:
+                train_pairs.append((src_id, dst_id))
+            elif ts < t2:
+                val_pairs.append((src_id, dst_id))
+            else:
+                src_ts = event_ts[id2ent[src_id]]
+                #Test on the last timestamp on the src and dst and if its the same -> drop (of the test)
+                if src_ts != ts:
+                    test_pairs.append((src_id, dst_id))
 
-    print(f"Pairs — train: {len(train_pairs)}  test: {len(test_pairs)}")
+    print(f"Pairs — train: {len(train_pairs)}  val: {len(val_pairs)}  test: {len(test_pairs)}")
 
-    fit_idx = torch.tensor(
-        [i for i, cid in enumerate(train_pair_cases) if cid in fit_cases],
-        dtype=torch.long, device=device)
-    val_idx = torch.tensor(
-        [i for i, cid in enumerate(train_pair_cases) if cid in val_cases],
-        dtype=torch.long, device=device)
-    print(f"Optuna pairs (out of train pairs only) — fit: {fit_idx.numel()}  val: {val_idx.numel()}")
+    rel2id: Dict[str, int] = {P_FOLLOWS: 0}
+    triples_by_case = collect_case_triples(g, ent2id, rel2id, case_map)
+    num_rel = len(rel2id)
 
-    train_pairs_t = torch.tensor(train_pairs, dtype=torch.long, device=device)
-    test_pairs_t   = torch.tensor(test_pairs,   dtype=torch.long, device=device)
+    print("Building prefix graphs …")
+    follows_rel = rel2id[P_FOLLOWS]
+    ei_tr,  et_tr,  nodes_tr,  src_tr  = build_prefix_batch(train_pairs, case_map, triples_by_case, follows_rel, device)
+    ei_val, et_val, nodes_val, src_val = build_prefix_batch(val_pairs,   case_map, triples_by_case, follows_rel, device)
+    ei_te,  et_te,  nodes_te,  src_te  = build_prefix_batch(test_pairs,  case_map, triples_by_case, follows_rel, device)
 
-    act_vocab: Dict[str, int] = {}
+    ei_tr,  et_tr  = add_inverse_edges(ei_tr,  et_tr,  num_rel)
+    ei_val, et_val = add_inverse_edges(ei_val, et_val, num_rel)
+    ei_te,  et_te  = add_inverse_edges(ei_te,  et_te,  num_rel)
+    ei_tr,  et_tr  = ei_tr.to(device),  et_tr.to(device)
+    ei_val, et_val = ei_val.to(device), et_val.to(device)
+    ei_te,  et_te  = ei_te.to(device),  et_te.to(device)
+
+    # scaled with the nodes of the train prefixes only: no val/test statistics
+    raw_features = build_node_features(g, ent2id, case_map, event_ts)
+    feat_mean, feat_std = feature_stats(raw_features, fit_nodes=nodes_tr.unique())
+    node_features = apply_standardize(raw_features, feat_mean, feat_std)
+    emb_dim = x.size(1)
+    x = torch.cat([x, node_features.to(device)], dim=1)
+
+    x_tr  = x[nodes_tr]   # node features duplicated per prefix subgraph
+    x_val = x[nodes_val]
+    x_te  = x[nodes_te]
+    print(f"Prefix batches — train: {nodes_tr.size(0)} nodes  |  "
+          f"val: {nodes_val.size(0)} nodes  |  test: {nodes_te.size(0)} nodes")
+
+    test_pairs_t = torch.tensor(test_pairs, dtype=torch.long, device=device)  # kept for the checkpoint
+
+    act_vocab: Dict[str, int] = {UNK: 0}
     c_vocabs:  Dict[str, Dict[str, int]] = {}
     n_keys:    set = set()
 
@@ -447,7 +524,7 @@ def main():
             act_vocab[a] = len(act_vocab)
         for k, v in oc.items():
             if k not in c_vocabs:
-                c_vocabs[k] = {}
+                c_vocabs[k] = {UNK: 0}
             if v not in c_vocabs[k]:
                 c_vocabs[k][v] = len(c_vocabs[k])
         n_keys.update(on.keys())
@@ -463,8 +540,9 @@ def main():
           f"categ attrs: {len(c_vocabs)}  num attrs: {len(n_keys)}")
 
     N_tr = len(train_pairs)
-    N_test = len(test_pairs)
-    N = N_tr + N_test
+    N_val = len(val_pairs)
+    N_te = len(test_pairs)
+    N = N_tr + N_val + N_te
 
     y_act  = torch.full((N,), -1, dtype=torch.long,  device=device)
     y_time = torch.full((N,), float("nan"),           device=device)
@@ -474,6 +552,7 @@ def main():
               for k in n_keys}
 
     _ts_cache: Dict[int, Optional[float]] = {}
+    n_negative_dt = 0
 
     def _get_ts(eid: int) -> Optional[float]:
         if eid not in _ts_cache:
@@ -481,46 +560,29 @@ def main():
             _ts_cache[eid] = parse_ts(t_str)
         return _ts_cache[eid]
 
-    for i, (src_id, dst_id) in enumerate(train_pairs):
-        a, t_str, oc, on = get_event_attrs(g, id2ent[dst_id])
-        if a in act_vocab:
-            y_act[i] = act_vocab[a]
-        ts_src = _get_ts(src_id)
-        ts_dst = parse_ts(t_str)
-        if ts_src is not None and ts_dst is not None:
-            y_time[i] = max(ts_dst - ts_src, 0.0)  
-        for k, v in oc.items():
-            sk = _sanitize(k)
-            if sk in y_c and v in c_vocabs[k]:
-                y_c[sk][i] = c_vocabs[k][v]
-        for k, v in on.items():
-            sk = _sanitize(k)
-            if sk in y_n:
-                try:
-                    y_n[sk][i] = float(v)
-                except (ValueError, TypeError):
-                    pass
+    for offset, pairs in ((0, train_pairs), (N_tr, val_pairs), (N_tr + N_val, test_pairs)):
+        for j, (src_id, dst_id) in enumerate(pairs):
+            i = offset + j
+            a, t_str, oc, on = get_event_attrs(g, id2ent[dst_id])
+            y_act[i] = act_vocab.get(a, act_vocab[UNK])
+            ts_src = _get_ts(src_id)
+            ts_dst = parse_ts(t_str)
+            if ts_src is not None and ts_dst is not None:
+                n_negative_dt += ts_dst < ts_src
+                y_time[i] = max(ts_dst - ts_src, 0.0)
+            for k, vocab in c_vocabs.items():
+                y_c[_sanitize(k)][i] = vocab.get(oc.get(k), vocab[UNK])
+            for k, v in on.items():
+                sk = _sanitize(k)
+                if sk in y_n:
+                    try:
+                        y_n[sk][i] = float(v)
+                    except (ValueError, TypeError):
+                        pass
 
-    for j, (src_id, dst_id) in enumerate(test_pairs):
-        i = N_tr + j
-        a, t_str, oc, on = get_event_attrs(g, id2ent[dst_id])
-        if a in act_vocab:
-            y_act[i] = act_vocab[a]
-        ts_src = _get_ts(src_id)
-        ts_dst = parse_ts(t_str)
-        if ts_src is not None and ts_dst is not None:
-            y_time[i] = max(ts_dst - ts_src, 0.0)   
-        for k, v in oc.items():
-            sk = _sanitize(k)
-            if sk in y_c and v in c_vocabs.get(k, {}):
-                y_c[sk][i] = c_vocabs[k][v]
-        for k, v in on.items():
-            sk = _sanitize(k)
-            if sk in y_n:
-                try:
-                    y_n[sk][i] = float(v)
-                except (ValueError, TypeError):
-                    pass
+    if n_negative_dt:
+        print(f"WARNING: {n_negative_dt} pairs have dst before src in time; "
+              f"event order is not temporal")
 
     y_time = torch.log1p(torch.clamp(y_time, min=0.0))
 
@@ -551,20 +613,13 @@ def main():
         "std_t":       float(std_t),
         "norm_stats":  norm_stats,
     }
-    vocabs_path = args.vocabs_out or os.path.splitext(args.save_best_test)[0] + "_vocabs.json"
+    vocabs_path = args.vocabs_out or os.path.splitext(args.save_best_val)[0] + "_vocabs.json"
     with open(vocabs_path, "w", encoding="utf-8") as f:
         json.dump(vocabs, f, indent=2)
     print(f"Saved vocabs/norm → {vocabs_path}")
 
 
-    def output_pairs_info(pairs, split_name, N_offset, out_path, edge_index, edge_type):
-        edge_dict = {}  # {(src, dst): [rel_ids]} 
-        for edge_idx, rel_id in enumerate(edge_type):
-            src, dst = int(edge_index[0, edge_idx].item()), int(edge_index[1, edge_idx].item())
-            if (src, dst) not in edge_dict:
-                edge_dict[(src, dst)] = []
-            edge_dict[(src, dst)].append(int(rel_id.item()))
-        
+    def output_pairs_info(pairs, N_offset, out_path):
         with open(out_path, "w", encoding="utf-8") as f:
             for i, (src_id, dst_id) in enumerate(pairs):
                 idx = N_offset + i
@@ -572,19 +627,13 @@ def main():
                 src_uri = id2ent[src_id]
                 dst_uri = id2ent[dst_id]
                 a, t_str, oc, on = get_event_attrs(g, dst_uri)
-                
-                src_emb = x_cpu[src_id].tolist()
-                dst_emb = x_cpu[dst_id].tolist()
-                
-                pair_edges = edge_dict.get((src_id, dst_id), [])
-                
+
                 entry = {
                     "pair_idx": i,
                     "src_id": src_id,
                     "dst_id": dst_id,
                     "src_uri": src_uri,
                     "dst_uri": dst_uri,
-                    "direct_edges_rel_ids": pair_edges,
                     "activity": a,
                     "timestamp_str": t_str,
                     "otherC": oc,
@@ -596,11 +645,14 @@ def main():
                 }
                 f.write(json.dumps(entry) + "\n")
 
-    train_info_path = os.path.splitext(args.save_best_test)[0] + "_train_info.jsonl"
-    test_info_path   = os.path.splitext(args.save_best_test)[0] + "_test_info.jsonl"
-    output_pairs_info(train_pairs, "train", 0, train_info_path, ei_tr, et_tr)
-    output_pairs_info(test_pairs, "test", N_tr, test_info_path, ei_test, et_test)
+    train_info_path = os.path.splitext(args.save_best_val)[0] + "_train_info.jsonl"
+    val_info_path   = os.path.splitext(args.save_best_val)[0] + "_val_info.jsonl"
+    test_info_path  = os.path.splitext(args.save_best_val)[0] + "_test_info.jsonl"
+    output_pairs_info(train_pairs, 0, train_info_path)
+    output_pairs_info(val_pairs, N_tr, val_info_path)
+    output_pairs_info(test_pairs, N_tr + N_val, test_info_path)
     print(f"Wrote all training info to {train_info_path}")
+    print(f"Wrote all validation info to {val_info_path}")
     print(f"Wrote all test info to {test_info_path}")
 
 
@@ -624,12 +676,16 @@ def main():
             otherC_weights[k] = None
     print(f"Computed class weights for {len(otherC_weights)} categorical attributes")
 
-    # optuna study
-    data_bundle = (x, ei_tr, et_tr, num_rel,
-                   train_pairs_t,
+    train_idx = torch.arange(N_tr,                device=device)
+    val_idx   = torch.arange(N_tr, N_tr + N_val,  device=device)
+    test_idx  = torch.arange(N_tr + N_val, N,     device=device)
+
+    # optuna validates on the real val set; test is never touched here
+    data_bundle = (x_tr, ei_tr, et_tr, src_tr,
+                   x_val, ei_val, et_val, src_val,
+                   num_rel, train_idx, val_idx,
                    y_act, y_time, y_c, y_n,
-                   N_tr, device, act_weight, otherC_weights,
-                   fit_idx, val_idx)
+                   device, act_weight, otherC_weights)
 
     study = optuna.create_study(direction="minimize",
                                 pruner=optuna.pruners.PercentilePruner(
@@ -638,86 +694,101 @@ def main():
         lambda trial: objective(trial, data_bundle, args),
         n_trials=args.trials,
     )
-    score_label = "validation" if val_idx.numel() > 0 else "train"
-    print(f"\nBest trial {score_label}-loss: {study.best_trial.value:.4f}")
+    print(f"\nBest trial val-loss: {study.best_trial.value:.4f}")
     print(f"Best params:         {study.best_params}")
 
     best   = study.best_params
     hid    = best["hid_dim"]
-    encoder = RGCNEncoder(x.size(1), hid, hid, num_rel,
+    encoder = RGCNEncoder(x_tr.size(1), hid, hid, num_rel * 2,
                           num_bases=best["num_bases"],
                           dropout=best["dropout"]).to(device)
-    head   = _make_head(hid, y_act[:N_tr],
-                        {k: v[:N_tr] for k, v in y_c.items()},
-                        y_n, device, head_hidden=best["head_hidden"])
+    head   = _make_head(hid, y_act, y_c, y_n, device, head_hidden=best["head_hidden"])
     opt    = torch.optim.Adam(
         list(encoder.parameters()) + list(head.parameters()),
         lr=best["lr"],
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    time_weight = best["time_weight"]
+    time_weight = time_w
     otherC_weight_factor = best["otherC_weight"]
     otherN_weight_factor = best["otherN_weight"]
 
-    train_idx = torch.arange(N_tr, device=device)
-    test_idx   = torch.arange(N_tr, N, device=device)
-
+    best_v = float("inf")
+    no_improve = 0
+    model_path = args.save_model or (os.path.splitext(args.save_best_val)[0] + "_model.pt")
+    # everything the explainers need to rebuild the exact model input
+    model_meta = {
+        "best_params":       best,
+        "in_dim":            int(x_tr.size(1)),
+        "emb_dim":           int(emb_dim),
+        "num_rel":           int(num_rel),       # base relations; encoder uses 2x (inverse edges)
+        "encoder_num_rel":   int(num_rel * 2),
+        "rel2id":            dict(rel2id),
+        "follows_rel":       int(follows_rel),
+        "n_act":             int(y_act.max().item()) + 1,
+        "otherC_num_classes": {k: int(y_c[k].max().item()) + 1 for k in y_c},
+        "otherN_keys":       list(y_n.keys()),
+        "time_weight":       float(time_weight),
+        "feat_mean":         feat_mean.detach().cpu(),
+        "feat_std":          feat_std.detach().cpu(),
+        "t1":                float(t1),
+        "t2":                float(t2),
+    }
     for epoch in range(args.epochs):
         encoder.train(); head.train()
         opt.zero_grad()
-        z   = encoder(x, ei_tr, et_tr)
-        out = head(z[train_pairs_t[:, 0]])
+        z   = encoder(x_tr, ei_tr, et_tr)
+        out = head(z[src_tr])
         loss = compute_loss(out, y_act, y_time, y_c, y_n, train_idx, time_weight, act_weight, otherC_weights, otherC_weight_factor, otherN_weight_factor)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(head.parameters()), max_norm=1.0)
         opt.step()
+
+        encoder.eval(); head.eval()
+        with torch.no_grad():
+            z_v   = encoder(x_val, ei_val, et_val)
+            v_out = head(z_v[src_val])
+            m_act = y_act[val_idx] >= 0
+            v_loss = (F.cross_entropy(v_out["act"][m_act], y_act[val_idx][m_act], weight=act_weight)
+                      if m_act.any() else torch.tensor(float("inf")))
+            m_t = torch.isfinite(y_time[val_idx])
+            if m_t.any():
+                v_loss = v_loss + time_weight * F.mse_loss(v_out["time"][m_t], y_time[val_idx][m_t])
+
         scheduler.step()
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1:4d}  train_loss={loss.item():.4f}")
+        if v_loss.item() < best_v:
+            best_v = v_loss.item()
+            no_improve = 0
+            # test predictions stored only for offline evaluation; never used for selection
+            with torch.no_grad():
+                z_te  = encoder(x_te, ei_te, et_te)
+                t_out = head(z_te[src_te])
+            torch.save({
+                "y_act":    y_act[test_idx],
+                "y_time":   y_time[test_idx],
+                "y_otherC": {k: y_c[k][test_idx] for k in y_c},
+                "y_otherN": {k: y_n[k][test_idx] for k in y_n},
+                "pred": {
+                    "act_logits":    t_out["act"],
+                    "time_pred_log": t_out["time"],
+                    "otherC_logits": t_out["otherC"],
+                    "otherN_pred":   t_out["otherN"],
+                },
+                "pairs_val": test_pairs_t,
+            }, args.save_best_val)
+            torch.save({
+                "encoder_state_dict": encoder.state_dict(),
+                "head_state_dict":    head.state_dict(),
+                **model_meta,
+            }, model_path)
+            print(f"Epoch {epoch:4d}  val_loss={v_loss.item():.4f}  ← saved")
+        else:
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(f"Early stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
+                break
 
-    # single inference pass on test set after training
-    encoder.eval(); head.eval()
-    with torch.no_grad():
-        z_t   = encoder(x, ei_test, et_test)
-        t_out = head(z_t[test_pairs_t[:, 0]])
-
-    torch.save({
-        "y_act":    y_act[test_idx],
-        "y_time":   y_time[test_idx],
-        "y_otherC": {k: y_c[k][test_idx] for k in y_c},
-        "y_otherN": {k: y_n[k][test_idx] for k in y_n},
-        "pred": {
-            "act_logits":    t_out["act"],
-            "time_pred_log": t_out["time"],
-            "otherC_logits": t_out["otherC"],
-            "otherN_pred":   t_out["otherN"],
-        },
-        "pairs_test": test_pairs_t,
-    }, args.save_best_test)
-
-    model_path = args.save_model or (os.path.splitext(args.save_best_test)[0] + "_model.pt")
-    train_act_valid = y_act[:N_tr][y_act[:N_tr] >= 0]
-    n_act_save = int(train_act_valid.max().item()) + 1 if train_act_valid.numel() > 0 else 1
-    otherC_num_classes = {}
-    for k in y_c:
-        m = y_c[k][:N_tr] >= 0
-        if m.any():
-            otherC_num_classes[k] = int(y_c[k][:N_tr][m].max().item()) + 1
-    torch.save({
-        "encoder_state_dict": encoder.state_dict(),
-        "head_state_dict":    head.state_dict(),
-        "best_params":          dict(best),
-        "in_dim":               int(x.size(1)),
-        "num_rel":              int(num_rel),
-        "rel2id":               dict(rel2id),
-        "n_act":                n_act_save,
-        "otherC_num_classes":   otherC_num_classes,
-        "otherN_keys":          sorted(y_n.keys()),
-        "time_weight":          float(time_weight),
-        "otherC_weight_factor": float(otherC_weight_factor),
-        "otherN_weight_factor": float(otherN_weight_factor),
-    }, model_path)
-    print(f"Training complete. Saved model -> {model_path}")
+    print(f"Saved test predictions → {args.save_best_val}")
+    print(f"Saved model checkpoint → {model_path}")
 
 
 if __name__ == "__main__":

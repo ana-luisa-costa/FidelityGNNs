@@ -1,11 +1,12 @@
 
 import csv
 import json
-import random
 from typing import Dict, Tuple, Optional
 
 import numpy as np
 import torch
+
+from src.utils.uri_helpers import parse_ts
 
 
 def load_entity2id(path: str) -> Dict[str, int]:
@@ -17,55 +18,28 @@ def load_embeddings(path: str) -> torch.Tensor:
     return torch.tensor(np.load(path), dtype=torch.float)
 
 
-def load_case_split(split_path: str) -> Tuple[set, set]:
+def load_temporal_boundaries(split_path: str) -> Tuple[float, float]:
     with open(split_path, encoding="utf-8") as f:
         d = json.load(f)
-    if "test" in d:
-        held_out = d["test"]
-    elif "val" in d:
-        held_out = d["val"]
-    else:
-        raise KeyError(
-            f"{split_path} has neither 'test' nor 'val' key (found: {list(d.keys())})"
-        )
-    return set(d["train"]), set(held_out)
+    return d["t1"], d["t2"]
 
 
-def load_case_split_from_csv(csv_path: str, train_ratio: float = 0.8, seed: int = 42, temporal: bool = False):
-    cases = {}  # case_id -> earliest_timestamp (for temporal split)
+def load_temporal_boundaries_from_csv(csv_path: str, train_ratio: float = 0.8,
+                                      val_ratio: float = 0.1) -> Tuple[float, float]:
+    """t1 and t2: the case-start quantiles that end the train and val windows."""
+    case_start: Dict[str, float] = {}
     with open(csv_path, encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            case_id = str(row["caseID_case_concept_name"]).strip()
-            if temporal:
-                timestamp_str = str(row["event_timestamp_time_timestamp"]).strip()
-                if case_id not in cases:
-                    cases[case_id] = timestamp_str
-                else:
-                    # Keep earliest timestamp for this case
-                    if timestamp_str < cases[case_id]:
-                        cases[case_id] = timestamp_str
-            else:
-                if case_id not in cases:
-                    cases[case_id] = None
+        for row in csv.DictReader(f):
+            cid = str(row["caseID_case_concept_name"]).strip()
+            ts = parse_ts(row["event_timestamp_time_timestamp"])
+            case_start[cid] = min(ts, case_start.get(cid, ts))
 
-    if temporal:
-        # Sort chronologically by earliest timestamp
-        unique_cases = sorted(cases.keys(), key=lambda c: cases[c])
-        split_mode = "temporal"
-    else:
-        # Random split
-        unique_cases = sorted(cases.keys())
-        rng = random.Random(seed)
-        rng.shuffle(unique_cases)
-        split_mode = "random"
-
-    n = len(unique_cases)
-    split = int(n * train_ratio)
-    train_cases = set(unique_cases[:split])
-    test_cases = set(unique_cases[split:])
-    print(f"Case split ({split_mode}): {len(train_cases)} train / {len(test_cases)} test  (total {n})")
-    return train_cases, test_cases, unique_cases
+    starts = sorted(case_start.values())
+    n = len(starts)
+    t1 = starts[int(n * train_ratio)]
+    t2 = starts[int(n * (train_ratio + val_ratio))]
+    print(f"Temporal boundaries: t1={t1}  t2={t2}  (from {n} cases)")
+    return t1, t2
 
 
 def load_pt(path: str) -> dict:

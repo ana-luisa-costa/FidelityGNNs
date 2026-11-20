@@ -21,7 +21,6 @@ from tqdm import tqdm
 from src.explainers._shared import (
     ExplainerContext,
     _entity_short_label,
-    _k_hop_subgraph,
     _pair_side_caption,
     add_common_explainer_args,
     load_explainer_context,
@@ -37,7 +36,7 @@ from src.explainers.gnnexplainer_core import (
     validate_classification_task,
 )
 from src.fidelity.fidelity_utils import task_target_value_nodes
-from src.gnn4ppm.train import _sanitize, get_event_attrs
+from gnn4ppm.train import _sanitize, get_event_attrs
 from src.utils.io_helpers import load_vocabs
 
 setup_matplotlib_style()
@@ -222,21 +221,12 @@ def main() -> None:
 
     for pair_idx in tqdm(context.pair_indices, desc="GNNExplainer pairs"):
         src_global, dst_global = context.test_pairs[pair_idx]
-        if args.gnn_subgraph_hop > 0:
-            nodes, edge_index, edge_type, global_to_local = _k_hop_subgraph(
-                seeds=[src_global, dst_global],
-                edge_index=context.ei_test,
-                edge_type=context.et_test,
-                num_nodes=context.x.size(0),
-                k=args.gnn_subgraph_hop,
-            )
-            x_sub = context.x[nodes.to(device)].detach()
-            edge_index, edge_type = edge_index.to(device), edge_type.to(device)
-        else:
-            nodes = torch.arange(context.x.size(0))
-            x_sub = context.x.detach()
-            edge_index, edge_type = context.ei_test, context.et_test
-            global_to_local = {node: node for node in range(context.x.size(0))}
+        # prefix graph of the pair (hop<=0 keeps the whole prefix); dst is not in it
+        nodes, edge_index, edge_type, global_to_local = context.pair_subgraph(
+            pair_idx, hops=max(0, int(args.gnn_subgraph_hop))
+        )
+        x_sub = context.x[nodes.to(device)].detach()
+        edge_index, edge_type = edge_index.to(device), edge_type.to(device)
 
         src_local = global_to_local[src_global]
         dst_local = global_to_local.get(dst_global, -1)

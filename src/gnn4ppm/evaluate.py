@@ -1,4 +1,3 @@
-
 import argparse
 import json
 from typing import Dict, Optional
@@ -55,10 +54,10 @@ def mae_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Dict[str, float]:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Evaluate R-GCN predictions on the test set."
+        description="Evaluate R-GCN predictions on the validation set."
     )
     ap.add_argument("--best",          required=True,
-                    help="best_test.pt saved by train_2.py (test data only).")
+                    help="best_val.pt saved by train_2.py (validation data only).")
     ap.add_argument("--output",        required=True,
                     help="Path to write the evaluation report (.txt).")
     ap.add_argument("--vocabs",        default=None,
@@ -84,8 +83,8 @@ def main():
 
     act_pred = act_logits.argmax(dim=-1)
 
-    N_test = y_act.size(0)
-    print(f"Evaluating {N_test} test pairs …")
+    N_val = y_act.size(0)
+    print(f"Evaluating {N_val} test pairs …")
 
     act_vocab = None   
     id2act    = None   
@@ -96,7 +95,7 @@ def main():
 
     id2ent = load_id2ent(args.entity2id) if args.entity2id else None
 
-    lines = [f"Test set — {N_test} pairs\n"]
+    lines = [f"Test set — {N_val} pairs\n"]
 
     act_m = cls_metrics(y_act, act_pred)
     lines.append("== Activity (next-event classification) ==")
@@ -122,14 +121,14 @@ def main():
                 continue
             lines.append(f"  {key}: {mae_metrics(y, yhat)}")
 
-    if args.show_examples > 0 and "pairs_test" in d:
-        pairs_test = d["pairs_test"] # (N_test, 2) node IDs
+    if args.show_examples > 0 and "pairs_val" in d:
+        pairs_val = d["pairs_val"]   # (N_val, 2) node IDs
         known_mask = (y_act >= 0).nonzero(as_tuple=True)[0]
         show_n = min(args.show_examples, len(known_mask))
         lines.append(f"\n== Examples (first {show_n} non-UNK test pairs) ==")
         for idx in known_mask[:show_n].tolist():
-            src_id = int(pairs_test[idx, 0].item())
-            dst_id = int(pairs_test[idx, 1].item())
+            src_id = int(pairs_val[idx, 0].item())
+            dst_id = int(pairs_val[idx, 1].item())
             src    = id2ent[src_id] if id2ent else str(src_id)
             dst    = id2ent[dst_id] if id2ent else str(dst_id)
             true_act_id = int(y_act[idx].item())
@@ -155,4 +154,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 

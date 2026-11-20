@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.explain.algorithm.utils import clear_masks
-from src.gnn4ppm.train import MultiTaskHead, RGCNEncoder, _sanitize
+from gnn4ppm.train import MultiTaskHead, RGCNEncoder, _sanitize
 
 _RESOURCE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_resource"
 _ROLE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_role"

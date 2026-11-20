@@ -11,6 +11,9 @@ __pycache__/
 
 # data & outputs
 data/
+data_19.11/
+old_19.11/
+results_19.11/
 *.pt
 *.pth
 *.ckpt

@@ -16,7 +16,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", FutureWarning)
     from pgmpy.estimators.CITests import chi_square
 
-from src.gnn4ppm.train import _sanitize
+from gnn4ppm.train import _sanitize
 
 
 _RESOURCE_OTHERC_RAW_KEY = "http://example.org/hasevent_otherC_org_resource"

@@ -15,22 +15,27 @@ import pandas as pd
 import torch
 from rdflib import Graph
 
-from src.gnn4ppm.train import (
+from gnn4ppm.train import (
     MultiTaskHead,
     RGCNEncoder,
     _sanitize,
-    build_graph,
-    build_train_directly_follows,
+    add_inverse_edges,
+    apply_standardize,
+    build_case_map,
+    build_node_features,
+    build_prefix_batch,
+    collect_case_triples,
     get_event_attrs,
+    split_pairs_by_time,
 )
 from src.utils.io_helpers import (
-    load_case_split,
     load_embeddings,
     load_entity2id,
     load_pt,
+    load_temporal_boundaries,
     load_vocabs,
 )
-from src.utils.uri_helpers import EVENT_RE
+from src.utils.uri_helpers import EVENT_RE, event_timestamps, usable_event_uris
 
 
 def setup_matplotlib_style() -> None:
@@ -50,13 +55,14 @@ def _build_model_from_checkpoint(
 ) -> Tuple[RGCNEncoder, torch.nn.Module]:
     best = ckpt["best_params"]
     hid = best["hid_dim"]
-    num_rel = ckpt["num_rel"]
+    # num_rel counts base relations; the encoder also sees their inverses
+    encoder_num_rel = int(ckpt.get("encoder_num_rel", ckpt["num_rel"]))
     in_dim = ckpt["in_dim"]
     encoder = RGCNEncoder(
         in_dim,
         hid,
         hid,
-        num_rel,
+        encoder_num_rel,
         num_bases=best["num_bases"],
         dropout=best["dropout"],
     ).to(device)
@@ -77,35 +83,59 @@ def _build_model_from_checkpoint(
     return encoder, head
 
 
-def _case_map_from_ent2id(
-    id2ent: Dict[int, str],
-) -> Dict[str, Dict[int, int]]:
-    case_map: Dict[str, Dict[int, int]] = {}
-    for nid, uri in id2ent.items():
-        m = EVENT_RE.search(uri)
-        if m:
-            ev_num, cid = int(m.group(1)), m.group(2)
-            case_map.setdefault(cid, {})[ev_num] = nid
-    return case_map
+def build_model_input(
+    ckpt: dict,
+    g: Graph,
+    ent2id: Dict[str, int],
+    emb: torch.Tensor,
+    case_map: Dict[str, List[int]],
+    event_ts: Dict[str, Optional[float]],
+) -> torch.Tensor:
+    """[RDF2Vec ‖ standardized time/case features], scaled with the train statistics
+    stored in the checkpoint so every node row equals the one seen in training."""
+    raw = build_node_features(g, ent2id, case_map, event_ts)
+    feats = apply_standardize(raw, ckpt["feat_mean"], ckpt["feat_std"])
+    x = torch.cat([emb.cpu(), feats], dim=1)
+    if x.size(1) != int(ckpt["in_dim"]):
+        raise ValueError(
+            f"Model input width mismatch: rebuilt {x.size(1)} columns, "
+            f"checkpoint expects {ckpt['in_dim']}"
+        )
+    return x
 
 
-def _build_train_test_pairs(
-    case_map: Dict[str, Dict[int, int]],
-    train_cases: Set[str],
-    test_cases: Set[str],
-) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-    train_pairs: List[Tuple[int, int]] = []
-    test_pairs: List[Tuple[int, int]] = []
-    for cid, km in case_map.items():
-        ks = sorted(km.keys())
-        case_pairs = [
-            (km[ks[i]], km[ks[i + 1]]) for i in range(len(ks) - 1) if ks[i] + 1 in km
-        ]
-        if cid in train_cases:
-            train_pairs.extend(case_pairs)
-        elif cid in test_cases:
-            test_pairs.extend(case_pairs)
-    return train_pairs, test_pairs
+def prefix_subgraph(
+    pair: Tuple[int, int],
+    case_map: Dict[str, List[int]],
+    triples_by_case: Dict[str, List[Tuple[int, int, int]]],
+    follows_rel: int,
+    num_rel: int,
+    hops: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[int, int]]:
+    """The model's input graph for one (src, dst) pair: the case prefix up to src
+    with inverse edges, optionally cut to the k-hop neighbourhood of src.
+
+    Returns (nodes_global, edge_index_local, edge_type_local, global_to_local).
+    dst is never part of the prefix, so it is absent from global_to_local.
+    """
+    ei, et, node_orig, src_pos = build_prefix_batch(
+        [pair], case_map, triples_by_case, follows_rel, torch.device("cpu")
+    )
+    ei, et = add_inverse_edges(ei, et, num_rel)
+    if hops <= 0:
+        g2l = {int(gid): local for local, gid in enumerate(node_orig.tolist())}
+        return node_orig, ei, et, g2l
+
+    kept_local, ei_sub, et_sub, local_g2l = _k_hop_subgraph(
+        seeds=[int(src_pos.item())],
+        edge_index=ei,
+        edge_type=et,
+        num_nodes=int(node_orig.size(0)),
+        k=hops,
+    )
+    nodes_global = node_orig[kept_local]
+    g2l = {int(gid): local for local, gid in enumerate(nodes_global.tolist())}
+    return nodes_global, ei_sub, et_sub, g2l
 
 
 def _scalar_for_task(
@@ -605,7 +635,8 @@ def add_common_explainer_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--ttl", required=True, help="RDF/Turtle knowledge-graph file.")
     ap.add_argument("--emb", required=True, help="Entity embeddings (.npy).")
     ap.add_argument("--entity2id", required=True, help="entity2id.json mapping.")
-    ap.add_argument("--case_split", required=True, help="case_split.json (train/test case IDs).")
+    ap.add_argument("--temporal_split", required=True,
+                    help="temporal_split.json (t1/t2 case-start boundaries from build_rdf2vec.py).")
     ap.add_argument("--model", required=True, help="*_model.pt checkpoint from train.py.")
     ap.add_argument("--vocabs", default=None, help="*_vocabs.json for activity names.")
     ap.add_argument(
@@ -642,10 +673,11 @@ class ExplainerContext:
     x: torch.Tensor
     g: Graph
     id2ent: Dict[int, str]
-    ei_test: torch.Tensor
-    et_test: torch.Tensor
     rel2id: Dict[str, int]
     num_rel: int
+    follows_rel: int
+    case_map: Dict[str, List[int]]
+    triples_by_case: Dict[str, List[Tuple[int, int, int]]]
     test_pairs: List[Tuple[int, int]]
     y_act_test: Optional[torch.Tensor]
     y_time_test: Optional[torch.Tensor]
@@ -657,6 +689,19 @@ class ExplainerContext:
     n_test: int
     pair_indices: List[int]
     rng: Any
+
+    def pair_subgraph(
+        self, pair_idx: int, hops: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[int, int]]:
+        """Prefix subgraph of test pair `pair_idx` (see prefix_subgraph)."""
+        return prefix_subgraph(
+            self.test_pairs[pair_idx],
+            self.case_map,
+            self.triples_by_case,
+            self.follows_rel,
+            self.num_rel,
+            hops=hops,
+        )
 
 
 def load_explainer_context(
@@ -675,35 +720,37 @@ def load_explainer_context(
 
     ent2id = load_entity2id(args.entity2id)
     id2ent: Dict[int, str] = {i: e for e, i in ent2id.items()}
-    x = load_embeddings(args.emb).to(device)
+    emb = load_embeddings(args.emb)
 
-    train_cases, test_cases = load_case_split(args.case_split)
+    t1, t2 = load_temporal_boundaries(args.temporal_split)
+    if "t2" in ckpt and abs(float(ckpt["t2"]) - float(t2)) > 1e-6:
+        print(f"[warn] temporal_split t2={t2} differs from checkpoint t2={ckpt['t2']}")
 
     print("Parsing TTL …")
     g = Graph()
     g.parse(args.ttl, format="turtle")
 
+    # same event filtering, ordering and pair split as train.py
+    usable = usable_event_uris(g)
+    event_ts = event_timestamps(g)
+    case_map = build_case_map(id2ent, usable, event_ts)
+    _, _, test_pairs = split_pairs_by_time(case_map, id2ent, event_ts, t1, t2)
+
     rel2id: Dict[str, int] = dict(ckpt["rel2id"])
     num_rel = len(rel2id)
     assert num_rel == ckpt["num_rel"], "TTL graph relation count mismatch with checkpoint"
+    follows_rel = int(ckpt.get("follows_rel", 0))
+    # frozen copy: collect_case_triples would otherwise register unseen relations
+    rel2id_grow = dict(rel2id)
+    triples_by_case = collect_case_triples(g, ent2id, rel2id_grow, case_map)
+    if len(rel2id_grow) != num_rel:
+        new_rels = sorted(set(rel2id_grow) - set(rel2id))
+        print(f"[warn] {len(new_rels)} relations not seen in training are dropped: {new_rels}")
+        triples_by_case = {
+            cid: [t for t in triples if t[2] < num_rel] for cid, triples in triples_by_case.items()
+        }
 
-    ei_test, et_test = build_graph(
-        g,
-        ent2id,
-        rel2id,
-        excluded_cases=train_cases,
-        allow_new_relations=False,
-    )
-    # same train-only directlyFollows edges the model was trained with
-    ei_df, et_df = build_train_directly_follows(
-        g, ent2id, rel2id, train_cases, allow_new_relations=False,
-    )
-    ei_test = torch.cat([ei_test, ei_df], dim=1)
-    et_test = torch.cat([et_test, et_df])
-    ei_test, et_test = ei_test.to(device), et_test.to(device)
-
-    case_map = _case_map_from_ent2id(id2ent)
-    _, test_pairs = _build_train_test_pairs(case_map, train_cases, test_cases)
+    x = build_model_input(ckpt, g, ent2id, emb, case_map, event_ts).to(device)
 
     y_act_test: Optional[torch.Tensor] = None
     y_time_test: Optional[torch.Tensor] = None
@@ -711,10 +758,10 @@ def load_explainer_context(
         bv = load_pt(args.best_test)
         y_act_test = bv["y_act"].to(device)
         y_time_test = bv["y_time"].to(device)
-        pv = bv["pairs_test"] 
+        pv = bv["pairs_val"] if "pairs_val" in bv else bv["pairs_test"]
         test_pairs_t = torch.tensor(test_pairs, dtype=torch.long)
-        if pv.shape != test_pairs_t.shape or not torch.all(pv == test_pairs_t):
-            print("[warn] best-test pairs_test differs from rebuilt test_pairs")
+        if pv.shape != test_pairs_t.shape or not torch.all(pv.cpu() == test_pairs_t):
+            print("[warn] best-test pairs differ from rebuilt test_pairs")
         if y_act_test.numel() != len(test_pairs):
             raise ValueError("best_test y_act length does not match number of test pairs")
 
@@ -741,10 +788,11 @@ def load_explainer_context(
         x=x,
         g=g,
         id2ent=id2ent,
-        ei_test=ei_test,
-        et_test=et_test,
         rel2id=rel2id,
         num_rel=num_rel,
+        follows_rel=follows_rel,
+        case_map=case_map,
+        triples_by_case=triples_by_case,
         test_pairs=test_pairs,
         y_act_test=y_act_test,
         y_time_test=y_time_test,

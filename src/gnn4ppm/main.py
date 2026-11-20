@@ -22,9 +22,9 @@ def run_cmd(cmd, name):
         return False
 
 def build_cmd(step, dataset, ttl, csv=None, seed=None):
-    if step == "build_rdf2vec": return ["python3", "-u", "src/gnn4ppm/build_rdf2vec.py", "--ttl", ttl, "--csv", csv, "--out", f"data/raw/{dataset}", "--seed", str(seed)]
-    if step == "train": return ["python3", "-u", "src/gnn4ppm/train.py", "--ttl", ttl, "--emb", f"data/raw/{dataset}/entity_embeddings.npy", "--entity2id", f"data/raw/{dataset}/entity2id.json", "--case_split", f"data/raw/{dataset}/case_split.json", "--save_best_test", f"data/processed/{dataset}/best_val.pt"]
-    if step == "evaluate": return ["python3", "-u", "src/gnn4ppm/evaluate.py", "--best", f"data/processed/{dataset}/best_val.pt", "--vocabs", f"data/processed/{dataset}/best_val_vocabs.json", "--entity2id", f"data/raw/{dataset}/entity2id.json", "--output", f"data/processed/{dataset}/evaluation.txt"]
+    if step == "build_rdf2vec": return ["python3", "-u", "src/build_rdf2vec.py", "--ttl", ttl, "--csv", csv, "--out", f"data/raw/{dataset}", "--seed", str(seed)]
+    if step == "train": return ["python3", "-u", "src/train.py", "--ttl", ttl, "--emb", f"data/raw/{dataset}/entity_embeddings.npy", "--entity2id", f"data/raw/{dataset}/entity2id.json", "--temporal_split", f"data/raw/{dataset}/temporal_split.json", "--save_best_val", f"data/processed/{dataset}/best_val.pt"]
+    if step == "evaluate": return ["python3", "-u", "src/evaluate.py", "--best", f"data/processed/{dataset}/best_val.pt", "--vocabs", f"data/processed/{dataset}/best_val_vocabs.json", "--entity2id", f"data/raw/{dataset}/entity2id.json", "--output", f"data/processed/{dataset}/evaluation.txt"]
 
 def main():
     p = argparse.ArgumentParser(description="Run RGCN4PPM pipeline")

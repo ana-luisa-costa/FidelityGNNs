@@ -17,7 +17,6 @@ from src.explainers._shared import (
     _enriched_label,
     _entity_category,
     _entity_short_label,
-    _k_hop_subgraph,
     _pair_side_caption,
     _plot_global_category,
     _plot_top_entities,
@@ -29,7 +28,7 @@ from src.explainers._shared import (
     setup_matplotlib_style,
     write_summary_json,
 )
-from src.gnn4ppm.train import get_event_attrs
+from gnn4ppm.train import get_event_attrs
 
 setup_matplotlib_style()
 
@@ -291,7 +290,6 @@ def main() -> None:
     ctx: ExplainerContext = load_explainer_context(args, device)
     encoder, head    = ctx.encoder, ctx.head
     x, g, id2ent     = ctx.x, ctx.g, ctx.id2ent
-    ei_test, et_test   = ctx.ei_test, ctx.et_test
     test_pairs        = ctx.test_pairs
     y_act_test, y_time_test = ctx.y_act_test, ctx.y_time_test
     act_vocab, id2act = ctx.act_vocab, ctx.id2act
@@ -310,30 +308,16 @@ def main() -> None:
         src_id, dst_id = test_pairs[pi]
 
         # ------------------------------------------------------------------
-        # k-hop subgraph extraction
+        # prefix-graph extraction (hop<=0 keeps the whole prefix); dst is not in it
         # ------------------------------------------------------------------
-        if args.ig_subgraph_hop > 0:
-            nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph(
-                seeds=[src_id, dst_id],
-                edge_index=ei_test,
-                edge_type=et_test,
-                num_nodes=x.size(0),
-                k=args.ig_subgraph_hop,
-            )
-            x_sub      = x[nodes_t.to(device)].detach()
-            ei_sub     = ei_sub.to(device)
-            et_sub     = et_sub.to(device)
-            src_local  = g2l[src_id]
-            dst_local  = g2l.get(dst_id, -1)
-
-        else:
-            nodes_t    = torch.arange(x.size(0))
-            x_sub      = x.detach()
-            ei_sub     = ei_test
-            et_sub     = et_test
-            src_local  = src_id
-            dst_local  = dst_id
-            g2l        = None
+        nodes_t, ei_sub, et_sub, g2l = ctx.pair_subgraph(
+            pi, hops=max(0, int(args.ig_subgraph_hop))
+        )
+        x_sub      = x[nodes_t.to(device)].detach()
+        ei_sub     = ei_sub.to(device)
+        et_sub     = et_sub.to(device)
+        src_local  = g2l[src_id]
+        dst_local  = g2l.get(dst_id, -1)
 
         N_sub      = x_sub.size(0)
         nodes_list = nodes_t.tolist()   # local index → global node id

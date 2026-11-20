@@ -31,7 +31,7 @@ from src.explainers.explainer_adapters import (
     ShapAdapter,
 )
 from src.explainers.explanation import ExplanationResult
-from src.explainers._shared import add_common_explainer_args, load_explainer_context, _k_hop_subgraph
+from src.explainers._shared import add_common_explainer_args, load_explainer_context
 from src.fidelity.config import load_config_defaults
 from src.fidelity.experiment_record import write_manifest, write_selected_pairs
 from src.fidelity.fidelity_utils import (
@@ -70,7 +70,7 @@ DEFAULTS = {
     "ttl": "data/raw/BPIC13_O/BPIC13_OpenProblems.ttl",
     "emb": "data/raw/BPIC13_O/entity_embeddings.npy",
     "entity2id": "data/raw/BPIC13_O/entity2id.json",
-    "case_split": "data/raw/BPIC13_O/case_split.json",
+    "temporal_split": "data/raw/BPIC13_O/temporal_split.json",
     "model": "data/processed/BPIC13_O/best_val_model.pt",
     "vocabs": "data/processed/BPIC13_O/best_val_vocabs.json",
     "best_test": "data/processed/BPIC13_O/best_val.pt",
@@ -109,6 +109,8 @@ def _build_arg_parser(config_defaults: Optional[Dict[str, Any]] = None) -> argpa
     # accept configs from before the val->test rename
     if "best_val" in defaults:
         defaults.setdefault("best_test", defaults.pop("best_val"))
+    # case_split configs predate the temporal split; the key is ignored
+    defaults.pop("case_split", None)
     parser = argparse.ArgumentParser(
         description="Compute PyG/GraphFramEx model-fidelity curves for RGCN explainers.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -124,7 +126,8 @@ def _build_arg_parser(config_defaults: Optional[Dict[str, Any]] = None) -> argpa
     parser.add_argument("--explainers", default=defaults.get("explainers", ",".join(DEFAULT_EXPLAINERS)),
                         help=f"Comma-separated explainers. Available: {', '.join(ALL_EXPLAINERS)}")
     parser.add_argument("--subgraph-hops", type=int, default=defaults.get("subgraph_hops", 3),
-                        help="k-hop subgraph depth; 3 matches the trained 3-layer RGCN.")
+                        help="k-hop neighbourhood of src inside the pair's prefix graph; "
+                             "3 matches the trained 3-layer RGCN, <=0 keeps the whole prefix.")
     parser.add_argument("--top-k-values", default=defaults.get("top_k_values", DEFAULT_TOP_K_VALUES),
                         help="Comma-separated fixed node counts for fidelity curves.")
     parser.add_argument(
@@ -455,12 +458,12 @@ def _write_aggregates(
             y_plus = group[f"mean_fid_{metric}_plus"].to_numpy(dtype=float)
             y_minus = group[f"mean_fid_{metric}_minus"].to_numpy(dtype=float)
             y_one_minus = 1.0 - y_minus
-            auc_plus = float(y_plus.mean())
-            auc_minus = float(y_minus.mean())
-            auc_one_minus = float(y_one_minus.mean())
-            norm_plus = auc_plus
-            norm_minus = auc_minus
-            norm_one_minus = auc_one_minus
+            auc_plus = float(auc_fn(y_plus, x))
+            auc_minus = float(auc_fn(y_minus, x))
+            auc_one_minus = float(auc_fn(y_one_minus, x))
+            norm_plus = auc_plus / span if span > 0 else float("nan")
+            norm_minus = auc_minus / span if span > 0 else float("nan")
+            norm_one_minus = auc_one_minus / span if span > 0 else float("nan")
             score = float("nan")
             if np.isfinite(norm_plus) and np.isfinite(norm_minus):
                 a = min(1.0, max(0.0, norm_plus))
@@ -545,13 +548,7 @@ def main() -> None:
         )
 
         try:
-            nodes_t, ei_sub, et_sub, g2l = _k_hop_subgraph(
-                seeds=[src_id, dst_id],
-                edge_index=ctx.ei_test,
-                edge_type=ctx.et_test,
-                num_nodes=ctx.x.size(0),
-                k=args.subgraph_hops,
-            )
+            nodes_t, ei_sub, et_sub, g2l = ctx.pair_subgraph(pair_idx, hops=args.subgraph_hops)
         except Exception as exc:
             warnings.warn(f"Subgraph extraction failed for pair={pair_idx}: {exc}")
             continue
@@ -564,7 +561,7 @@ def main() -> None:
             g2l,
             ctx.rel2id,
             ctx.num_rel,
-            required_global_nodes=(src_id, dst_id),
+            required_global_nodes=(src_id,),
         )
         if et_sub.numel() == 0:
             suffix = (
@@ -580,17 +577,12 @@ def main() -> None:
                 f"subgraph for pair={pair_idx}"
             )
             continue
-        if dst_id not in g2l:
-            warnings.warn(
-                f"dst_id={dst_id} not found in {args.heterogeneity_mode} "
-                f"subgraph for pair={pair_idx}"
-            )
-            continue
 
         x_sub = ctx.x[nodes_t.to(device)].detach()
         ei_sub = ei_sub.to(device)
         et_sub = et_sub.to(device)
         src_local = g2l[src_id]
+        # the prefix graph ends at src, so the target event is never a node
         dst_local = g2l.get(dst_id, -1)
         base_protected_nodes = tuple(
             node for node in (src_local, dst_local) if 0 <= int(node) < x_sub.size(0)

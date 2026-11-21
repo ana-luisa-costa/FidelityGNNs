@@ -74,7 +74,8 @@ def split_pairs_by_time(case_map: Dict[str, List[int]], id2ent: Dict[int, str],
                 train_pairs.append((src_id, dst_id))
             elif ts < t2:
                 val_pairs.append((src_id, dst_id))
-            else:
+            elif event_ts[id2ent[src_id]] != ts:
+                # same filter as main(): drop test pairs whose src and dst share a timestamp
                 test_pairs.append((src_id, dst_id))
     return train_pairs, val_pairs, test_pairs
 

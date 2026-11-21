@@ -761,7 +761,7 @@ def load_explainer_context(
         pv = bv["pairs_val"] if "pairs_val" in bv else bv["pairs_test"]
         test_pairs_t = torch.tensor(test_pairs, dtype=torch.long)
         if pv.shape != test_pairs_t.shape or not torch.all(pv.cpu() == test_pairs_t):
-            print("[warn] best-test pairs differ from rebuilt test_pairs")
+            raise ValueError("best-test pairs differ from rebuilt test_pairs")
         if y_act_test.numel() != len(test_pairs):
             raise ValueError("best_test y_act length does not match number of test pairs")
 

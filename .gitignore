@@ -13,7 +13,7 @@ __pycache__/
 data/
 data_19.11/
 old_19.11/
-results_19.11/
+results_secondrun/
 *.pt
 *.pth
 *.ckpt

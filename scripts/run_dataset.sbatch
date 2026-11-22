@@ -18,7 +18,8 @@ IFS=_ read -r EP OPT TR <<< "$RUN"
 declare -A TTL=(
   [BPIC12_A]=BPIC12_Subprocess_Application [BPIC12_W]=BPIC12_Subprocess_Work
   [BPIC12_WC]=BPIC12_WC [BPIC13_O]=BPIC13_OpenProblems
-  [BPIC20_P]=BPIC20_P [BPIC20_R]=BPIC20_Request )
+  [BPIC20_P]=BPIC20_P [BPIC20_R]=BPIC20_Request 
+  [BPIC13_I]=BPIC13_Incidents [BPIC17_O]=BPIC17_Offer)
 
 RAW=data/raw/$DS
 OUT=data/processed_$RUN/$DS

@@ -238,22 +238,22 @@ python -m src.explainers.explain_fox \
 
 ### Results Friedman test and Nemenyi comparisons.
 
-| Explainer A | Explainer B | Difference | p-value |
-|---|---|---:|---:|:---:|
-| Gradient | PGMExplainer | 2.375 | 0.1129 | 
-| IG | PGMExplainer | 2.125 | 0.2057 | 
-| GraphLIME | PGMExplainer | 2.000 | 0.2676 | 
-| SHAP | PGMExplainer | 1.750 | 0.4203 | 
-| Gradient | GNNExplainer | 1.625 | 0.5070 | 
-| IG | GNNExplainer | 1.375 | 0.6836 | 
-| GraphLIME | GNNExplainer | 1.250 | 0.7648 | 
-| SHAP | GNNExplainer | 1.000 | 0.8937 | 
-| GNNExplainer | PGMExplainer | 0.750 | 0.9673 | 
-| Gradient | SHAP | 0.625 | 0.9854 | 
-| Gradient | GraphLIME | 0.375 | 0.9987 | 
-| IG | SHAP | 0.375 | 0.9987 | 
-| Gradient | IG | 0.250 | 0.9998 | 
-| GraphLIME | SHAP | 0.250 | 0.9998 | 
-| IG | GraphLIME | 0.125 | 1.0000 | 
+| Explainer A  | Explainer B  | Difference | p-value |
+|--------------|--------------|-----------:|--------:|
+| Gradient     | PGMExplainer |      2.375 |  0.1129 |
+| IG           | PGMExplainer |      2.125 |  0.2057 |
+| GraphLIME    | PGMExplainer |      2.000 |  0.2676 |
+| SHAP         | PGMExplainer |      1.750 |  0.4203 |
+| Gradient     | GNNExplainer |      1.625 |  0.5070 |
+| IG           | GNNExplainer |      1.375 |  0.6836 |
+| GraphLIME    | GNNExplainer |      1.250 |  0.7648 |
+| SHAP         | GNNExplainer |      1.000 |  0.8937 |
+| GNNExplainer | PGMExplainer |      0.750 |  0.9673 |
+| Gradient     | SHAP         |      0.625 |  0.9854 |
+| Gradient     | GraphLIME    |      0.375 |  0.9987 |
+| IG           | SHAP         |      0.375 |  0.9987 |
+| Gradient     | IG           |      0.250 |  0.9998 |
+| GraphLIME    | SHAP         |      0.250 |  0.9998 |
+| IG           | GraphLIME    |      0.125 |  1.0000 |
 
 The pairwise comparisons are not statistically significant. The largest difference is observed between Gradient and PGMExplainer (2.375), with a p-value of 0.1129.
